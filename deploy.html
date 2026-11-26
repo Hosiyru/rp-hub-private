@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="referrer" content="no-referrer">
+<title>部署我的私人站点 · RP-Hub</title><link rel="stylesheet" href="assets/css/local.css"><link rel="stylesheet" href="assets/css/private.css"></head>
+<body><main><header><a href="private.html">‹ 私人站点</a><span>RP-Hub</span></header><h1>部署我的私人站点</h1>
+<section><h2>1. 保存站主认领口令</h2><p>口令在此设备生成。部署时填入 Cloudflare 的 CLAIM_SECRET，首次打开站点时再用它认领。</p>
+<button id="generate">生成并复制口令</button><input id="secret" readonly aria-label="站主认领口令" hidden></section>
+<section><h2>2. 部署到你的 Cloudflare</h2><p>在 Cloudflare 连接你的 GitHub 或 GitLab，确认 Worker、D1、私有 R2 和队列名称。首次使用 R2 时，Cloudflare 可能要求你开通 R2。资源和账单归当前选择的账号。</p>
+<a id="deploy" class="file-button" href="https://deploy.workers.cloudflare.com/?url=https%3A%2F%2Fgithub.com%2FHosiyru%2Frp-hub-private" target="_blank" rel="noopener noreferrer">部署到我的 Cloudflare ↗</a></section>
+<section><h2>3. 认领并连接设备</h2><p>打开部署成功页给出的 workers.dev 地址，创建本站账号。电脑登录后可生成手机配对码，APK 也可以填写站点地址并用同一个账号登录。</p></section>
+<p role="status" id="status"></p></main><script src="assets/js/deploy.js"></script></body></html>

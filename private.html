@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer"><title>私人站点 · RP-Hub</title>
+<link rel="stylesheet" href="assets/css/local.css"><link rel="stylesheet" href="assets/css/private.css"></head>
+<body><main>
+<header><a href="index.html">‹ 本地游玩</a><a href="deploy.html">部署到我的 CF</a></header>
+<h1>私人站点</h1><p id="where">连接玩家自己的站点，使用本站账号。</p>
+<section id="connect"><h2>连接站点</h2>
+<form id="addressForm"><label for="address">站点地址</label><div class="row"><input id="address" type="url" placeholder="https://你的站点.workers.dev" required><button>连接</button></div></form>
+<div class="row scan-actions"><button id="scan">扫码连接</button><label class="file-button" for="qrFile">从图片读取二维码</label><input id="qrFile" type="file" accept="image/*" hidden></div>
+<div id="camera" hidden><video playsinline muted></video><button id="stopCamera">关闭相机</button></div></section>
+<section id="auth" hidden><h2 id="authTitle">登录本站</h2>
+<form id="authForm">
+<label for="name">本站账号名</label><input id="name" maxlength="48" autocomplete="username" required>
+<label for="loginKey">账号登录密钥</label><div class="row"><input id="loginKey" type="password" autocomplete="current-password" required><button id="newKey" type="button" hidden>生成并复制</button></div>
+<div id="proofRow" hidden><label id="proofLabel" for="proof">站主认领口令</label><input id="proof" type="password" autocomplete="off"></div>
+<label id="savedRow" hidden><input id="savedKey" type="checkbox"> 我已保存账号名和登录密钥</label>
+<div class="row actions"><button id="authSubmit" class="primary">登录</button><button id="authMode" type="button">使用邀请码注册</button></div></form>
+<div id="redeemRow" hidden><p>二维码可一次性登录到签发它的账号。请核对上方站点地址。</p><button id="redeem" class="primary">使用配对码登录此站</button></div></section>
+<section id="account" hidden><h2 id="identity">本站账号</h2><div class="row actions"><button id="pair">生成手机配对码</button><button id="invite" hidden>生成邀请码</button><button id="logout">解绑此设备</button></div>
+<div id="ticketBox" hidden><img id="qr" width="224" height="224" alt="手机一次性登录二维码"><p id="ticketInfo"></p><button id="copyTicket">复制</button><button id="hideTicket">收起</button></div></section>
+<section id="migration" hidden><h2>首次迁入</h2><p>先看两边各有什么。确认后，本机进度在云端另存一份，选中的云档在本机另开进度。</p>
+<button id="preview">比较本机与云端</button><button id="resume" hidden>继续上次中断的迁入</button>
+<div id="comparison" hidden><h3>本机当前进度</h3><p id="localSummary"></p><h3>本站云档</h3><div id="cloudList"></div>
+<label for="mode">本设备后续同步方式</label><select id="mode"><option value="manual">手动</option><option value="auto">自动（记录偏好，第四阶段启用）</option></select>
+<div class="row actions"><button id="confirm" class="primary">保留双方并迁入</button><button id="cancel">取消</button></div></div>
+<div id="result"></div></section>
+<section id="health" hidden><h2>部署验证</h2><p>用一条测试记录核对 D1、私有 R2 和队列读写。</p><button id="probe">检查本站绑定</button></section>
+<p role="status" aria-live="polite" id="status"></p>
+</main>
+<script src="assets/js/local-scope.js"></script><script src="assets/js/local-library.js"></script>
+<script src="assets/js/local-archive.js"></script><script src="assets/js/private-archives.js"></script>
+<script src="assets/vendor/qrcode.js"></script><script src="assets/vendor/jsQR.js"></script>
+<script src="assets/js/private-site.js"></script></body></html>

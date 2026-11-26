@@ -1,0 +1,21 @@
+{
+  "name": "rp-hub-private-site",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node cloud/build.mjs",
+    "deploy": "wrangler d1 migrations apply DB --remote && wrangler deploy",
+    "dev:cf": "npm run build && wrangler d1 migrations apply DB --local && wrangler dev --local"
+  },
+  "devDependencies": {
+    "wrangler": "4.168.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "CLAIM_SECRET": {
+        "description": "站主一次性认领口令。用发行页生成的随机口令，部署完成后在自己的新站点认领。"
+      }
+    }
+  }
+}

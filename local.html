@@ -1,0 +1,17 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>本地存档 · RP-Hub</title><link rel="stylesheet" href="assets/css/local.css"></head>
+<body><main><header><a href="index.html" id="back">‹ 返回游玩</a><a href="private.html">私人站点与登录</a></header>
+<h1>本地存档</h1><p id="context">读取当前进度…</p>
+<section><h2>命名存档点</h2><p>记下此刻的聊天、图片和卡内进度。以后可以从这里另开分支。</p>
+<form id="pointForm"><label for="name">存档名称</label><div class="row"><input id="name" maxlength="80" required placeholder="例如：进入矿坑前"><button class="primary">留存档点</button></div></form><ul id="points"></ul></section>
+<section><h2>换机档案</h2><p>导出全部本地进度和命名点。文件可能含聊天、图片和模型密钥，请自行保管。</p>
+<div class="row"><button id="export">导出完整档案</button><button id="choose">选择档案导入</button><input id="file" type="file" accept=".json,application/json" hidden></div>
+<div id="review" hidden><p id="summary"></p><div class="row"><button id="apply" class="primary">导入为独立进度</button><button id="cancel">取消</button></div></div></section>
+<section><h2>本机进度</h2><ul id="runs"></ul></section>
+<section id="native" hidden><h2>手机文件镜像</h2><p id="mirrorStatus">读取手机副本…</p><div class="row"><button id="recover">检查最近副本</button><button id="older">检查上一份副本</button></div></section>
+<p role="status" aria-live="polite" id="status"></p></main>
+<script>
+if (location.protocol !== 'file:' && !new URLSearchParams(location.search).has('preview'))
+    for (const name of ['local-scope','local-library','local-archive','local-native'])
+        document.write('<script src="assets/js/' + name + '.js"><\/script>');
+</script><script src="assets/js/local-panel.js"></script></body></html>
