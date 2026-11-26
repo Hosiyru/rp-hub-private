@@ -1,5 +1,5 @@
 /* The APK ships these assets in its package. A hosted copy retains the same shell after the first online visit. */
-const cacheName='rph-local-shell-3.0.0';
+const cacheName='rph-local-shell-3.0.1';
 const shell=[
     'index.html','local.html','private.html','deploy.html','character/index.html','novel/index.html',
     ...['theme','styles','local','private'].map(n=>'assets/css/'+n+'.css'),
@@ -17,7 +17,11 @@ self.addEventListener('activate',event=>event.waitUntil((async()=>{
 self.addEventListener('fetch',event=>{
     if(event.request.method!=='GET')return;
     const url=new URL(event.request.url);
-    if(url.href.split('?')[0]===self.registration.scope)url.pathname+='index.html';
+    if(url.href.split('?')[0]===self.registration.scope){
+        // Let the private site's server choose its online landing page. Offline, open the local game.
+        event.respondWith(fetch(event.request).catch(async()=> (await caches.open(cacheName)).match(new URL('index.html',self.registration.scope).href)));
+        return;
+    }
     url.search='';
     if(!allowed.has(url.href))return;
     event.respondWith(caches.open(cacheName).then(async c=>await c.match(url.href)||fetch(event.request)));

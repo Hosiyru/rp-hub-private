@@ -3,7 +3,7 @@
     'use strict';
     const archive=RPLocalArchive, {decode,encode,hash}=archive.codec;
     const chunkSize=2*1024*1024;
-    const secret=/^(api[_-]?key|apiProviderKeys|imageGenKey|access[_-]?token|refresh[_-]?token|authorization|password|client[_-]?secret|embeddingApiKey|customApiKey)$/i;
+    const secret=/^(api[_-]?key|apiProviderKeys|imageGenKey|access[_-]?token|refresh[_-]?token|authorization|password|client[_-]?secret|embeddingApiKey|customApiKey|tavilyApiKey)$/i;
     function scrub(value) {
         if(typeof value==='string') return value.replace(/([?&](?:token|api_key|apikey|access_token)=)[^&#"'\s<>]*/gi,'$1');
         if(Array.isArray(value))return value.map(scrub);
