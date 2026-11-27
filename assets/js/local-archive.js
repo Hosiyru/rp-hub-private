@@ -95,7 +95,7 @@
             if (run!==root || registeredKeys.has(key) || /^(rp_hub_|rphub[-_]|roleplay_hub_|ai_chargen_|fate[-_])/.test(key))
                 storage.push([logical(run,key),scope.disk.getItem(key)]);
         }
-        if (scope.disk.getItem(revisionKey) !== revision) throw Error('进度在读取期间发生变化，请重试留档');
+        if (scope.disk.getItem(revisionKey) !== revision) throw Object.assign(Error('进度在读取期间发生变化，请重试留档'),{code:'SAVE_CHANGED'});
         return {dbs,storage};
     }
     function refs(state) { return state.dbs.flatMap(d=>d.stores.flatMap(s=>s.rows.map(row=>row[1]))); }
@@ -103,12 +103,18 @@
     async function checkpoint(name) {
         name = String(name).trim();
         if (!name || name.length>80) throw Error('请输入 1 至 80 字的存档名');
-        const blocks = {}, state = await snapshot(scope.id,blocks);
+        let blocks,state;
+        for(let attempt=0;;attempt++){
+            blocks={};
+            try{state=await snapshot(scope.id,blocks);break;}
+            catch(e){if(e.code!=='SAVE_CHANGED'||attempt>=3)throw e;await new Promise(ok=>setTimeout(ok,250*(attempt+1)));}
+        }
         const point = {id:uid(),run:scope.id,name,time:Date.now(),state};
         const tx = (await meta).transaction(['points','blocks'],'readwrite');
         Object.entries(blocks).forEach(([k,v])=>tx.objectStore('blocks').put(v,k));
         tx.objectStore('points').add(point,point.id);
         await done(tx);
+        scope.changed();
         return point;
     }
     async function portable(onlyRun) {
@@ -117,7 +123,8 @@
         for (const run of await runs()) {
             if (onlyRun && onlyRun!==run.id) continue;
             const state = await snapshot(run.id,blocks);
-            entries.push({...run,state,points:points.filter(p=>p.run===run.id).map(({name,time,state})=>({name,time,state}))});
+            const {syncCopy,...identity}=run;
+            entries.push({...identity,state,points:points.filter(p=>p.run===run.id).map(({name,time,state})=>({name,time,state}))});
         }
         for (const p of points) for (const id of refs(p.state)) if (!Object.hasOwn(blocks,id)) {
             blocks[id] = await get('blocks',id);
@@ -183,8 +190,9 @@
                 }
             });
             try {
-                for (const s of d.stores) {
-                    const rows=await Promise.all(s.rows.map(async ([key,id])=>[decode(key),decode(JSON.parse(await block(id)))]));
+                // Only the completed namespace becomes visible. Keep decoded rows bounded during large imports.
+                for (const s of d.stores) for(let offset=0;offset<s.rows.length;offset+=16){
+                    const rows=await Promise.all(s.rows.slice(offset,offset+16).map(async ([key,id])=>[decode(key),decode(JSON.parse(await block(id)))]));
                     const tx=db.transaction(s.name,'readwrite'), completion=done(tx), store=tx.objectStore(s.name);
                     try { for (const [key,value] of rows) s.keyPath===null ? store.add(value,key) : store.add(value); }
                     catch(e) { tx.abort(); await completion.catch(()=>{}); throw e; }
@@ -209,7 +217,7 @@
         } catch(e) {await discard(run.id); throw e;}
         return run.id;
     }
-    async function importPackage({body,digest}) {
+    async function importPackage({body,digest},syncCopy) {
         return navigator.locks.request('rph-import',async ()=>{
             const previous=await get('imports',digest);
             if (previous) return previous;
@@ -218,6 +226,7 @@
             try {
                 for (const entry of body.runs) {
                     const run={id:uid(),name:entry.name+' · 导入',sources:[...new Set([entry.id,...(entry.sources||[])])]};
+                    if(syncCopy)run.syncCopy={key:syncCopy.key,digest};
                     staged.push(run);
                     await materialize(run.id,entry.state,k=>body.blocks[k]);
                     if(entry.id===body.active) active=run.id;
@@ -235,6 +244,25 @@
             } catch(e) {for(const r of staged) await discard(r.id); throw e;}
         });
     }
+    async function retireSyncCopy({old,next,stamp,key}) {
+        if(old===root || old===scope.id || next!==scope.id || scope.disk.getItem(scope.activeKey)!==next)return false;
+        return navigator.locks.request('rph-live/'+old,{ifAvailable:true},async lock=>{
+            if(!lock)return false;
+            return navigator.locks.request('rph-import',async()=>{
+                const before=await get('runs',old),after=await get('runs',next);
+                if(!before)return true;
+                if(before.syncCopy?.key!==key || after?.syncCopy?.key!==key || !after.sources.includes(old))return false;
+                if((scope.disk.getItem('__rph_revision_'+old)||'')!==stamp)return false;
+                const points=(await all('points')).filter(p=>p.run===old);
+                const kept=new Set((await all('points')).filter(p=>p.run===next).map(p=>p.time+'/'+p.name));
+                if(points.some(p=>!kept.has(p.time+'/'+p.name)))return false;
+                const tx=(await meta).transaction(['imports','points','runs'],'readwrite');
+                tx.objectStore('imports').delete(before.syncCopy.digest);tx.objectStore('runs').delete(old);
+                for(const p of points)tx.objectStore('points').delete(p.id);
+                await done(tx);await discard(old);return true;
+            });
+        });
+    }
     async function activate(id) {
         if (!(await runs()).some(r=>r.id===id)) throw Error('进度不存在');
         sessionStorage.setItem(scope.activeKey,id);
@@ -249,5 +277,5 @@
         }
         return result;
     }
-    window.RPLocalArchive={inventory,checkpoint,portable,readPackage,importPackage,fork,activate,runs,points:()=>all('points'),codec:{decode,encode,hash}};
+    window.RPLocalArchive={inventory,checkpoint,portable,readPackage,importPackage,retireSyncCopy,fork,activate,runs,points:()=>all('points'),codec:{decode,encode,hash}};
 })();

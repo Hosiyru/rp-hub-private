@@ -27,15 +27,40 @@
         if(ticket && !/^[A-Za-z0-9_-]{43}$/.test(ticket))throw Error('配对码格式无效');
         return {origin:value.origin,ticket};
     }
-    async function api(path,{method='GET',json,body,raw}={}) {
-        const headers={'X-RP-Site':linked.site};
-        if(json!==undefined){headers['Content-Type']='application/json';body=JSON.stringify(json);}
-        const session=saved();
-        if(mobile && session?.origin===linked.origin && session.site===linked.site && session.token)headers.Authorization='Bearer '+session.token;
-        const res=await fetch(linked.origin+'/api/private/v1'+path,{method,body,headers,credentials:mobile?'omit':'same-origin',redirect:'error',cache:'no-store'});
-        if(!res.ok){let reason;try{reason=(await res.json()).error;}catch{}throw Error(reason||'站点请求失败 ('+res.status+')');}
-        return raw?res:res.json();
+    const api=(path,options)=>RPPrivateAPI.request(linked,path,options);
+    let releaseTarget,releaseTimer,releaseSession=0;
+    function resetRelease(){
+        releaseSession++;clearTimeout(releaseTimer);releaseTarget=null;
+        show('siteRelease',false);show('releaseInstall',false);$('releaseState').textContent='';
     }
+    async function releaseAction(action){
+        const session=releaseSession,apply=$('releaseInstall'),check=$('releaseCheck');
+        clearTimeout(releaseTimer);check.disabled=true;apply.disabled=true;
+        try{
+            const r=action==='install'?await api('/updates',{method:'POST',json:{revision:releaseTarget.revision}}):
+                await api(action==='check'?'/updates/latest':'/updates');
+            if(session!==releaseSession)return;
+            $('releaseCurrent').textContent='本站当前版本 '+r.installed.version;
+            if(r.latest)releaseTarget=r.latest;
+            const pending=['queued','building','deployed'].includes(r.state);
+            const available=releaseTarget && releaseTarget.version!==r.installed.version && (r.available??true);
+            show('releaseInstall',!!available && r.ready && !pending);
+            if(available)apply.textContent='更新本站到 '+releaseTarget.version;
+            let message='';
+            if(pending){
+                message=(r.state==='queued'?'已提交更新，等待部署 ':'正在部署 ')+r.target.version+'。可以离开此页。';
+                releaseTimer=setTimeout(()=>releaseAction('status'),5000);
+            }else if(['failed','expired'].includes(r.state))message='上次更新未确认上线。请查看 Cloudflare 构建日志，再检查新版重试。';
+            else if(r.state==='installed' && !available)message=r.installed.version+' 已上线。';
+            else if(r.latest)message=r.available?'可用新版 '+r.latest.version+'。':'本站已是最新发行版本。';
+            if(available && !r.ready)message+=' 启用按钮前，请在本站 Worker 配置 RP_UPDATE_HOOK（见部署模板说明）。';
+            $('releaseState').textContent=message;
+        }catch(err){
+            if(session===releaseSession){$('releaseState').textContent=err.message+'。可重新检查。';show('releaseInstall',false);}
+        }finally{if(session===releaseSession){check.disabled=false;apply.disabled=false;}}
+    }
+    $('releaseCheck').onclick=()=>releaseAction('check');
+    $('releaseInstall').onclick=()=>releaseAction('install');
     function setAction(next) {
         action=next;
         const setup=action!=='login';
@@ -48,11 +73,22 @@
     }
     async function sessionReady() {
         account=await api('/me');
+        RPPrivateSync.reset();$('jobList').replaceChildren();$('jobOutput').textContent='';
+        RPPrivateAPI.save({...saved(),account:account.id,syncVersion:linked.syncVersion,gameVersion:linked.gameVersion,imageVersion:linked.imageVersion});
+        if(linked.syncVersion===1)RPPrivateSync.restoreMode(local.getItem('__rph_mode_'+journalKey()));
+        show('jobs',linked.syncVersion===1);show('sync',linked.syncVersion===1);$('syncMode').value=RPPrivateSync.mode();renderSync();
+        RPPrivateSync.schedule(1000);
         $('identity').textContent=account.name+(account.role==='owner'?' · 站主':'');
         show('auth',false);show('account',true);show('migration',true);show('health',account.role==='owner');show('invite',account.role==='owner');
+        resetRelease();
+        if(account.role==='owner' && linked.release){
+            show('siteRelease',true);$('releaseCheck').disabled=false;
+            $('releaseCurrent').textContent='本站当前版本 '+linked.release.version;
+            void releaseAction('status');
+        }
         show('resume',!!await transfer.pending(journalKey()));
         $('mode').value=local.getItem('__rph_mode_'+journalKey())||'manual';
-        say('已登录。可先比较两边的存档。');
+        say(linked.syncVersion===1?'已登录。可先比较两边的存档。':'已登录旧版站点，可使用首次迁入。升级私人站点后即可使用日常同步。');
     }
     async function connect(text) {
         const {origin,ticket}=endpoint(text);
@@ -61,10 +97,10 @@
         if(!res.ok)throw Error('无法连接私人站点。可返回本地游玩，稍后重试。');
         const info=await res.json();
         if(info.service!=='rp-hub-private'||info.version!==1||!/^[a-f0-9]{32}$/.test(info.site))throw Error('该地址未部署兼容的 RP-Hub 私人站点');
-        linked={site:info.site,origin,claimed:info.claimed};pairTicket=ticket;
-        account=null;preview=null;
+        linked={site:info.site,origin,release:info.release,claimed:info.claimed,syncVersion:info.syncVersion||0,gameVersion:info.gameVersion||0,imageVersion:info.imageVersion||0};pairTicket=ticket;
+        resetRelease();account=null;preview=null;
         $('address').value=origin;$('where').textContent=origin;$('result').replaceChildren();
-        for(const id of ['account','migration','health','comparison','ticketBox'])show(id,false);
+        for(const id of ['account','migration','health','comparison','ticketBox','jobs','sync'])show(id,false);
         show('auth',true);show('redeemRow',!!ticket);show('authForm',!ticket);
         setAction(info.claimed?'login':'claim');
         const previous=saved();
@@ -92,8 +128,8 @@
         let revoked=false;
         try{await api('/logout',{method:'POST'});revoked=true;}catch{}
         local.setItem(storageKey,JSON.stringify({origin:linked.origin,site:linked.site,detached:true}));
-        account=null;preview=null;pairTicket='';copyValue='';
-        for(const id of ['migration','health','ticketBox','account','comparison','redeemRow'])show(id,false);
+        resetRelease();account=null;preview=null;pairTicket='';copyValue='';RPPrivateSync.reset();$('jobList').replaceChildren();$('jobOutput').textContent='';
+        for(const id of ['migration','health','ticketBox','account','comparison','redeemRow','jobs','sync'])show(id,false);
         $('qr').removeAttribute('src');$('ticketInfo').textContent='';show('authForm',true);show('auth',true);setAction('login');
         say(revoked?'此设备已解绑，本机进度仍可游玩':'本机已解绑。远端暂未确认撤销，会话到期失效。');
     });
@@ -164,6 +200,7 @@
         const k=journalKey();
         try{
             const {imported,mode}=await transfer.migrate(api,k,plan);local.setItem('__rph_mode_'+k,mode);
+            if(linked.syncVersion===1){RPPrivateSync.allowFirst();RPPrivateSync.changeMode(mode);$('syncMode').value=mode;}
             preview=null;show('comparison',false);const box=$('result');box.replaceChildren();
             const runs=await RPLocalArchive.runs();
             for(const id of imported){
@@ -187,6 +224,31 @@
             await new Promise(ok=>setTimeout(ok,1000));
         }
         say('D1、R2 写入已验证，队列尚未确认消费');
+    });
+    function renderSync(){
+        $('syncState').textContent=RPPrivateSync.status;
+        const select=$('branches'),value=select.value;
+        select.replaceChildren(...RPPrivateSync.heads.map(h=>new Option(h.label+' · '+(h.branch==='main'?'主进度':h.branch.slice(0,8))+' · '+new Date(h.created*1000).toLocaleString(),h.branch)));
+        if([...select.options].some(o=>o.value===value))select.value=value;
+        show('branchRow',select.length>1);
+    }
+    window.addEventListener('rph-sync-status',renderSync);
+    $('syncMode').onchange=()=>RPPrivateSync.changeMode($('syncMode').value);
+    $('push').onclick=perform(()=>RPPrivateSync.run('push'));
+    $('pull').onclick=perform(()=>RPPrivateSync.run('pull',$('branches').value));
+    $('listBranches').onclick=perform(()=>RPPrivateSync.run('list'));
+    $('loadJobs').onclick=perform(async()=>{
+        const list=await RPPrivateJobs.list();$('jobList').replaceChildren();$('jobOutput').textContent='';
+        if(!list.length)$('jobList').textContent='本站暂无生成任务';
+        for(const job of list){
+            const button=document.createElement('button');button.type='button';
+            button.textContent=new Date(job.updated*1000).toLocaleString()+' · '+({queued:'等待生成',running:'生成中',done:'已完成',interrupted:'已中断'}[job.status]);
+            button.onclick=perform(async()=>{
+                const out=$('jobOutput');out.textContent='';
+                const result=await RPPrivateJobs.replay(job,undefined,delta=>{out.textContent+=delta.content||delta.reasoning||'';});
+                out.textContent=result.content||result.reasoning||'生成结束';
+            });$('jobList').append(button);
+        }
     });
     const prev=saved();
     const initial=mobile?prev?.origin:location.origin+'/private.html'+location.hash;

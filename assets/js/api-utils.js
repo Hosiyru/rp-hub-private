@@ -91,7 +91,7 @@
         else options.signal?.addEventListener('abort', abort, { once: true });
         touch();
         try {
-            const response = await fetch(options.url, {
+            const response = options.transport ? await options.transport(options, controller.signal) : await fetch(options.url, {
                 method: options.body === undefined ? 'GET' : 'POST',
                 headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${options.apiKey}` },
                 ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
@@ -110,8 +110,11 @@
             if (timedOut && !options.signal?.aborted) {
                 const timeout = new Error('API 响应超时，请稍后重试');
                 timeout.name = 'TimeoutError';
+                if(options.backgroundJob && options.transport)timeout.backgroundJob=options.backgroundJob.id;
                 throw timeout;
             }
+            if(options.backgroundJob && options.transport && (error instanceof TypeError || error.status>=500 || error.message?.includes('上游生成已中断')))
+                error.backgroundJob=options.backgroundJob.id;
             throw error;
         } finally {
             clearTimeout(timer);
@@ -407,7 +410,7 @@
         for (let attempt = 1; ; attempt++) {
             try { return await requestChatCompletionOnce(options, attempt); }
             catch (error) {
-                if (!error.retryableEmptyToolReply || attempt >= 3 || options.signal?.aborted) throw error;
+                if (options.transport || !error.retryableEmptyToolReply || attempt >= 3 || options.signal?.aborted) throw error;
             }
         }
     };

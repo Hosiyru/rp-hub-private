@@ -587,6 +587,8 @@ const app = createApp({
             imageModel: 'nai-diffusion-4-5-full',
             imageSize: '竖图',
             imageGenCount: 2,
+            imageGenerator:'jobs',imageServiceUrl:'',imageServiceModel:'',
+            imageSteps:28,imageScale:6,imageCfg:0,imageSampler:'k_dpmpp_2m_sde',imageNoise:'karras',imageResolution:'',imageNegative:'',
             qualityModel: DEFAULT_API_CONFIG.qualityModel,
             balancedModel: DEFAULT_API_CONFIG.balancedModel,
             fastModel: DEFAULT_API_CONFIG.fastModel
@@ -915,6 +917,8 @@ const app = createApp({
         const savingUserMessage = ref(false);
         const isConversationBusy = computed(() => savingUserMessage.value || isGenerating.value || hasActiveToolInlineWork.value);
 
+        window.RPGenerationActive=()=>isGenerating.value;
+        window.RPGameBusy=()=>activeImageWrites>0 || isConversationBusy.value || !!userInput.value || !!pendingChatImages.value.length;
         const presets = ref([]);
         // 抗截断只临时停用 COT，不改写用户保存的开关状态。
         const isPresetEnabled = preset => preset.enabled !== false
@@ -1386,6 +1390,7 @@ const app = createApp({
         const requestTrackedChatCompletion = (options, type) => {
             const apiUrl = settings.apiUrl;
             const request = { url: buildApiEndpoint(apiUrl, 'chat/completions'), apiKey: settings.apiKey, ...options };
+            if (options.backgroundJob && window.RPPrivateSync?.mode()==='auto') request.transport=RPPrivateJobs.transport(options.backgroundJob);
             return requestChatCompletion({ ...request, onUsage: (usage, metrics) => recordApiUsage(usage, {
                 type, model: request.model, apiUrl, apiKey: request.apiKey, ...metrics
             }) });
@@ -1642,7 +1647,7 @@ const app = createApp({
                 await setStoredValue('global_ui_templates', globalUiTemplates.value);
                 await setStoredValue('active_tools', normalizeActiveTools(), { clone: false });
                 // 守卫：初始化完成前不写入用户/记忆数据，防止默认值覆盖服务端已有数据
-                if (_initComplete) {
+                if (_initComplete && !options.startup) {
                     await setStoredValue('user', user);
                     await setStoredValue('user_profiles', JSON.parse(JSON.stringify(userProfiles.value)));
                     if (activeProfileId.value) await setStoredValue('active_profile_id', activeProfileId.value);
@@ -1655,7 +1660,7 @@ const app = createApp({
                 }
 
                 // Save Memory State
-                await saveMemorySettingsNow();
+                if (!options.startup) await saveMemorySettingsNow();
                 if (saveMemories) {
                     await saveClassicMemoriesNow();
                 }
@@ -1944,220 +1949,98 @@ const app = createApp({
             if (entry) entry.enabled = enabled;
         };
 
-        const generatedImageTasks = new Map();
-        let generatedImageObserver = null;
-
-        const fetchImageJobJson = async (url, options) => {
-            const response = await fetch(url, options);
-            const text = await response.text();
-            let payload = {};
-            try { payload = text ? JSON.parse(text) : {}; } catch { /* 交给下方统一报错 */ }
-            if (!response.ok) throw new Error(payload.error || text || `HTTP ${response.status}`);
-            return payload;
-        };
-
-        const renderGeneratedImageJob = (card, task, job) => {
-            if (!card.isConnected) return task.cards.delete(card);
-            task.job = job;
-            card.dataset.imageJobId = job.id || '';
-            const progress = Math.max(0, Math.min(100, Number(job.generationProgress?.percent || 0)));
-            const label = card.querySelector('.generated-image-progress-label');
-            const bar = card.querySelector('.generated-image-progress-bar');
-            card.classList.toggle('is-waiting', job.status === 'queued');
-            if (bar) bar.style.width = `${progress}%`;
-
-            if (job.status === 'queued') {
-                if (label) label.textContent = job.queuePosition
-                    ? `排队中 · 第 ${job.queuePosition} / ${job.queuedCount || job.queuePosition} 个`
-                    : '排队中';
-                return;
-            }
-            if (job.status === 'running') {
-                if (label) label.textContent = `生成中 ${Math.round(progress)}%`;
-                return;
-            }
-
-            const imageUrl = job.imageUrl
-                ? new URL(job.imageUrl, task.baseUrl).href
-                : job.id
-                    ? `${task.baseUrl}/api/jobs/${encodeURIComponent(job.id)}/content?token=${encodeURIComponent(task.token)}`
-                    : '';
-            if (!imageUrl) {
-                card.classList.remove('is-generating');
-                card.classList.add('is-generation-error');
-                if (label) label.textContent = job.error || '生成失败';
-                return;
-            }
-
-            const image = card.querySelector('img');
-            image.style.height = '100%';
-            image.src = imageUrl;
-            card.classList.remove('is-generating', 'is-generation-error', 'is-waiting');
-            card.dataset.imageJobState = job.status;
-        };
-
-        const startGeneratedImageTask = (requestUrl, fresh = false) => {
-            const request = new URL(requestUrl, window.location.href);
-            const token = request.searchParams.get('token') || settings.imageGenKey.trim();
-            request.searchParams.set('token', token);
-            const key = fresh ? `${request.href}#${Date.now()}-${Math.random()}` : request.href;
-            if (generatedImageTasks.has(key)) return generatedImageTasks.get(key);
-            const task = { key, requestUrl: request.href, baseUrl: request.origin, token, cards: new Set(), job: null };
-            const publish = (job) => {
-                task.job = job;
-                [...task.cards].forEach(card => renderGeneratedImageJob(card, task, job));
-            };
-            task.promise = (async () => {
-                let job = await fetchImageJobJson(`${task.baseUrl}/api/jobs`, {
-                    method: 'POST',
-                    headers: { 'content-type': 'application/json' },
-                    body: JSON.stringify(Object.fromEntries(request.searchParams.entries()))
-                });
-                publish(job);
-                let pollFailures = 0;
-                while (!['done', 'failed'].includes(job.status)) {
-                    await new Promise(resolve => setTimeout(resolve, 150));
-                    try {
-                        job = await fetchImageJobJson(`${task.baseUrl}/api/jobs/${encodeURIComponent(job.id)}?token=${encodeURIComponent(task.token)}`);
-                        pollFailures = 0;
-                    } catch (error) {
-                        if (++pollFailures < 5) continue;
-                        throw error;
-                    }
-                    publish(job);
+        let generatedImageObserver,activeImageWrites=0;
+        const cardsLoading=new WeakSet(),imageUrls=new Map();
+        const providerChoices=ref(RPImageProviders.list());
+        window.addEventListener('rph-image-providers-change',()=>providerChoices.value=RPImageProviders.list());
+        const serviceKey=computed({get:()=>RPImageProviders.readKey(settings.imageServiceUrl),set:v=>RPImageProviders.saveKey(settings.imageServiceUrl,v)});
+        function imageRequest(){
+            const baseUrl=IMAGE_GEN_BASE_URL;
+            const encodedTargetArtists=encodeURIComponent(cardUtils.getImageStyleArtists(settings.imageStyle,settings.customImageArtists));
+            return `${baseUrl}/generate?tag=$1&model=${settings.imageModel}&artist=${encodedTargetArtists}&size=${settings.imageSize}&steps=40&scale=6&cfg=0&sampler=k_dpmpp_2m_sde&negative={{{{bad anatomy}}}},{bad feet},bad hands,{{{bad proportions}}},{blurry},cloned face,cropped,{{{deformed}}},{{{disfigured}}},error,{{{extra arms}}},{extra digit},{{{extra legs}}},extra limbs,{{extra limbs}},{fewer digits},{{{fused fingers}}},gross proportions,ink eyes,ink hair,jpeg artifacts,{{{{long neck}}}},low quality,{malformed limbs},{{missing arms}},{missing fingers}},{{missing legs}},{{{more than 2 nipples}}},mutated hands,{{{mutation}}},normal quality,owres,{{poorly drawn face}},{{poorly drawn hands}},reen eyes,signature,text,{{too many fingers}},{{{ugly}}},username,uta,watermark,worst quality,{{{more than 2 legs}}},awkward hand sign,weird hand gesture,contorted hand,unnatural finger pose,deformed hand gesture,{shaka},{hang loose},{{rock on}},{shaka sign}&nocache=0&noise_schedule=karras`;
+        }
+        function imagePlan(){
+            const params=RPImages.params(new URL(imageRequest()).searchParams);
+            delete params.tag;
+            Object.assign(params,{model:settings.imageModel,size:settings.imageSize,artist:cardUtils.getImageStyleArtists(settings.imageStyle,settings.customImageArtists)});
+            const bounded=(v,min,max,fallback)=>Number.isFinite(v)?Math.max(min,Math.min(max,v)):fallback;
+            Object.assign(params,{steps:String(Math.round(bounded(settings.imageSteps,1,28,28))),scale:String(bounded(settings.imageScale,0,10,6)),cfg:String(bounded(settings.imageCfg,0,1,0)),
+                sampler:settings.imageSampler,noise_schedule:settings.imageNoise});
+            if(settings.imageResolution)params.resolution=settings.imageResolution;
+            if(settings.imageNegative?.trim())params.negative=settings.imageNegative.trim();
+            const plan={producer:RPImages.device(),provider:settings.imageGenerator||'jobs',style:settings.imageStyle,params};
+            if(plan.provider==='compatible'){plan.endpoint=RPImageProviders.endpoint(settings.imageServiceUrl);plan.model=settings.imageServiceModel;}
+            return plan;
+        }
+        function freezeImagePlan(msg){
+            if(msg && !msg.rphImagePlan && cardUtils.findUnprotectedMatches(msg.content||'',getImageTagRegex()).length)msg.rphImagePlan=imagePlan();
+        }
+        function forgetImage(card){
+            const url=imageUrls.get(card);if(url){URL.revokeObjectURL(url);imageUrls.delete(card);}
+        }
+        const imageSelector='.generated-image-card[data-image-request]';
+        async function loadGeneratedImageCard(card,redraw=false){
+            if(cardsLoading.has(card))return;
+            const row=card.closest('[data-chat-index]'),message=chatHistory.value[Number(row?.dataset.chatIndex)];
+            if(!row||!currentCharacter.value||!message?.id||message.id!==row.dataset.messageId)return;
+            const index=[...row.querySelectorAll(imageSelector)].indexOf(card);
+            const tags=cardUtils.findUnprotectedMatches(message.content||'',getImageTagRegex()).map(m=>m[1].trim());
+            const prompt=tags[index];if(!prompt)return;
+            if(message.cloudPartial || (isGenerating.value && message===chatHistory.value.at(-1)))return;
+            const context={story:getCurrentStoryBranchScopeId(),branch:activeStoryBranchId.value,owner:currentCharacter.value.uuid,name:currentCharacter.value.name,
+                message:message.id,index,prompt,occurrence:tags.slice(0,index).filter(s=>s===prompt).length};
+            const plan=redraw?imagePlan():message.rphImagePlan;
+            const label=card.querySelector('.generated-image-progress-label'),img=card.querySelector('img'),button=card.querySelector('.generated-image-reroll');
+            const show=text=>{if(label)label.textContent=text;};
+            cardsLoading.add(card);card.dataset.imageJobState='loading';activeImageWrites++;
+            if(button)button.disabled=true;
+            try{
+                const result=await RPImages.resolve(context,plan,(chosen,fresh)=>RPImageProviders.generate(chosen,prompt,fresh,settings.imageGenKey.trim(),show),{redraw});
+                if(!card.isConnected || row.dataset.messageId!==message.id)return;
+                if(!result.blob)throw Error(result.record.status==='pending'?'原图尚未就绪，确认原设备已同步后再打开，或单独重绘':'原图缺失，可在图库补回或单独重绘');
+                forgetImage(card);const url=URL.createObjectURL(result.blob);imageUrls.set(card,url);
+                img.src=url;img.alt=prompt;card.dataset.imageDigest=result.record.digest;
+                let open=img.closest('.generated-image-open');
+                if(!open){open=document.createElement('button');open.type='button';open.className='generated-image-open';img.replaceWith(open);open.append(img);}
+                open.setAttribute('aria-label','打开原图：'+prompt);
+                open.onclick=()=>{
+                    const dialog=document.getElementById('originalImageDialog'),full=dialog.querySelector('img');
+                    const source=URL.createObjectURL(result.blob);full.src=source;full.alt=prompt;
+                    dialog.addEventListener('close',()=>{full.removeAttribute('src');URL.revokeObjectURL(source);},{once:true});
+                    dialog.showModal();
+                };
+                card.style.aspectRatio=result.record.plan?.params?.size==='横图'?'1216 / 832':result.record.plan?.params?.size==='方图'?'1':'832 / 1216';
+                card.dataset.imageJobState='done';card.classList.remove('is-generating','is-generation-error','is-waiting');
+            }catch(e){
+                if(!card.isConnected)return;
+                if(redraw && imageUrls.has(card)){
+                    card.dataset.imageJobState='done';showToast(e.message+'，已保留原图','warning');
+                }else{
+                    card.dataset.imageJobState='failed';card.classList.remove('is-generating');card.classList.add('is-generation-error');
+                    show(e.message);if(redraw)showToast(e.message,'warning');
                 }
-                if (fresh && job.status === 'done') {
-                    const reusableRequest = new URL(task.requestUrl);
-                    reusableRequest.searchParams.set('nocache', '0');
-                    generatedImageTasks.delete(task.key);
-                    task.key = reusableRequest.href;
-                    generatedImageTasks.set(task.key, task);
-                }
-                return job;
-            })().catch((error) => {
-                const job = { status: 'failed', error: error.message || '生成失败' };
-                publish(job);
-                return job;
+            }finally{cardsLoading.delete(card);activeImageWrites--;if(button)button.disabled=false;}
+        }
+        function hydrateGeneratedImages(root){
+            if(!root)return;
+            const cards=root.matches(imageSelector)?[root]:root.querySelectorAll(imageSelector);
+            for(const card of cards)if(!card.dataset.imageJobState)loadGeneratedImageCard(card);
+        }
+        function clearImageUrls(){for(const card of imageUrls.keys())if(!card.isConnected)forgetImage(card);}
+        watch(chatContainer,container=>{
+            generatedImageObserver?.disconnect();clearImageUrls();if(!container)return;
+            generatedImageObserver=new MutationObserver(records=>{
+                clearImageUrls();
+                for(const r of records)for(const node of r.addedNodes)if(node.nodeType===1)hydrateGeneratedImages(node);
             });
-            generatedImageTasks.set(key, task);
-            return task;
-        };
-
-        const ensureGeneratedImageProgressUi = (card) => {
-            if (card.querySelector('.generated-image-progress')) return;
-            const progress = document.createElement('div');
-            progress.className = 'generated-image-progress';
-            progress.setAttribute('aria-live', 'polite');
-            progress.innerHTML = '<svg class="generated-image-spinner" viewBox="0 0 50 50" aria-hidden="true"><circle class="generated-image-spinner-path" cx="25" cy="25" r="20" fill="none" stroke-width="2"></circle></svg><span class="generated-image-progress-label">等待生成</span><span class="generated-image-progress-track"><i class="generated-image-progress-bar"></i></span>';
-            card.appendChild(progress);
-        };
-
-        const loadGeneratedImageCard = (card, requestUrl = card.dataset.imageRequest, options = {}) => {
-            if (!requestUrl) return Promise.resolve({ status: 'failed' });
-            ensureGeneratedImageProgressUi(card);
-            generatedImageTasks.forEach(task => task.cards.delete(card));
-            card.querySelector('img')?.setAttribute('alt', '');
-            const animationTime = performance.now();
-            card.querySelector('.generated-image-spinner')?.style.setProperty('animation-delay', `-${animationTime % 2000}ms`);
-            card.querySelector('.generated-image-spinner-path')?.style.setProperty('animation-delay', `-${animationTime % 1500}ms`);
-            const label = card.querySelector('.generated-image-progress-label');
-            const bar = card.querySelector('.generated-image-progress-bar');
-            const task = startGeneratedImageTask(requestUrl, options.fresh === true);
-            if (!task.job) {
-            if (label) label.textContent = '等待生成';
-                if (bar) bar.style.width = '0%';
-            }
-            task.cards.add(card);
-            card.dataset.imageRequest = requestUrl;
-            card.dataset.imageJobState = 'loading';
-            card.classList.add('is-generating');
-            card.classList.remove('is-generation-error');
-            const size = new URL(requestUrl, window.location.href).searchParams.get('size');
-            card.style.aspectRatio = size === '横图' ? '1216 / 832' : size === '方图' ? '1' : '832 / 1216';
-            if (task.job) renderGeneratedImageJob(card, task, task.job);
-            return task.promise;
-        };
-
-        const hydrateGeneratedImages = (root) => {
-            const cards = root.matches('.generated-image-card[data-image-request]')
-                ? [root]
-                : [...root.querySelectorAll('.generated-image-card[data-image-request]')];
-            cards.forEach(card => {
-                if (!card.dataset.imageJobState) loadGeneratedImageCard(card);
-            });
-        };
-
-        watch(chatContainer, (container) => {
-            generatedImageObserver?.disconnect();
-            if (!container) return;
-            generatedImageObserver = new MutationObserver(records => {
-                records.forEach(record => record.addedNodes.forEach(node => {
-                    if (node.nodeType === Node.ELEMENT_NODE) hydrateGeneratedImages(node);
-                }));
-            });
-            generatedImageObserver.observe(container, { childList: true, subtree: true });
-            hydrateGeneratedImages(container);
+            generatedImageObserver.observe(container,{childList:true,subtree:true});hydrateGeneratedImages(container);
         });
-
-        const handleGeneratedImageReroll = async (event, messageIndex) => {
-            const button = event.target.closest('.generated-image-reroll');
-            if (!button) return;
-            event.preventDefault();
-            event.stopPropagation();
-            if (isConversationBusy.value) {
-                showToast('请等待当前回复完成后再重新生成图片', 'warning');
-                return;
-            }
-
-            const card = button.closest('.generated-image-card');
-            const cards = [...event.currentTarget.querySelectorAll('.generated-image-card')];
-            const imageIndex = cards.indexOf(card);
-            const message = chatHistory.value[messageIndex];
-            const sourceText = String(message?.content || '');
-            const imageMatches = cardUtils.findUnprotectedMatches(sourceText, getImageTagRegex());
-            const imageMatch = imageMatches[imageIndex];
-            if (!message || imageIndex < 0 || !imageMatch) return;
-            if (card.classList.contains('is-rerolling')) return;
-
-            const tags = imageMatch[1].split(',').map(tag => tag.trim()).filter(Boolean);
-            if (tags.length < 2) {
-                showToast('提示词太短，无法重新生成', 'warning');
-                return;
-            }
-            const swapIndex = Math.floor(Math.random() * (tags.length - 1));
-            [tags[swapIndex], tags[swapIndex + 1]] = [tags[swapIndex + 1], tags[swapIndex]];
-            const updatedToken = `image###${tags.join(', ')}###`;
-            const updatedContent = sourceText.slice(0, imageMatch.index)
-                + updatedToken
-                + sourceText.slice(imageMatch.index + imageMatch[0].length);
-            const sourceUrl = card.dataset.imageRequest || card.querySelector('img')?.getAttribute('src');
-            if (!sourceUrl) return;
-            const nextImageUrl = new URL(sourceUrl, window.location.href);
-            nextImageUrl.searchParams.set('tag', tags.join(', '));
-            nextImageUrl.searchParams.set('nocache', '1');
-
-            const originalContent = message.content;
-            const finishLoading = () => {
-                card.classList.remove('is-rerolling');
-                button.disabled = false;
-            };
-            card.classList.add('is-rerolling');
-            button.disabled = true;
-
-            const job = await loadGeneratedImageCard(card, nextImageUrl.href, { fresh: true });
-            if (job.status === 'done') {
-                if (chatHistory.value[messageIndex] !== message || message.content !== originalContent) {
-                    finishLoading();
-                    return;
-                }
-                message.content = updatedContent;
-                message.shouldAnimate = false;
-                scheduleChatHistorySave();
-                showToast('已重新生成图片', 'success');
-                nextTick(finishLoading);
-                return;
-            }
-            finishLoading();
+        watch(isGenerating,busy=>{if(!busy)nextTick(()=>hydrateGeneratedImages(chatContainer.value));});
+        const handleGeneratedImageReroll=(event)=>{
+            const button=event.target.closest('.generated-image-reroll');if(!button)return;
+            event.preventDefault();event.stopPropagation();
+            if(isConversationBusy.value)return showToast('请等待当前回复结束','warning');
+            loadGeneratedImageCard(button.closest(imageSelector),true);
         };
 
         const updateImageGenRegexState = ({ enableRegex = false } = {}) => {
@@ -2377,6 +2260,9 @@ const app = createApp({
             .sort((a, b) => (Number(b.template.order) || 0) - (Number(a.template.order) || 0) || a.index - b.index)
             .map(item => item.template));
         const activeUiTemplates = computed(() => currentUiTemplates.value.filter(t => t.enabled !== false));
+        const fateSyncLabel=ref('游戏进度在本机');
+        window.addEventListener('rph-sync-status',()=>{fateSyncLabel.value=RPPrivateSync.status;});
+        RPFateSaves.bind(()=>activeUiTemplates.value.some(t=>t.id===RPFateSaves.template)?getCurrentStoryBranchScopeId():null);
         const isUiTemplateAnalysisEnabled = () => settings.uiTemplateEnabled
             && settings.uiTemplateMainModelAnalysis
             && activeUiTemplates.value.length > 0;
@@ -2433,6 +2319,7 @@ const app = createApp({
                 return { handled: false, changed: false };
             }
             delete targetMessage.uiTemplateAnalysisFailure;
+            delete targetMessage.rphFateTurn;
             const recordFailure = (reason) => {
                 const summary = summarizeUiTemplateFailure(reason);
                 targetMessage.uiTemplateAnalysisFailure = {
@@ -2479,6 +2366,8 @@ const app = createApp({
                 });
             });
 
+            const token=RPFateSaves.tokenFromUpdates(updates,templates);
+            if(token)targetMessage.rphFateTurn=token;
             attachUiTemplateBlocksToLastAssistant({ targetMessageId: targetMessage.id });
 
             if (changedFieldCount > 0) {
@@ -3512,6 +3401,7 @@ const app = createApp({
         };
 
         const stopGeneration = () => {
+            if(isGenerating.value)window.RPPrivateJobs?.stop()?.catch(()=>showToast('站点尚未确认中止，可从后台生成查看状态','warning'));
             abortUiTemplateUpdate();
             abortSafely(abortController.value, 'Generation cancelled by user');
             abortSafely(activeToolQueueAbortController, 'Generation cancelled by user');
@@ -3554,9 +3444,17 @@ const app = createApp({
             chatImageSelectionEpoch++;
             pendingChatImages.value = [];
         };
+        const interactionKey=story=>'rp_hub_pending_interaction_'+story;
+        const readInteraction=story=>story?JSON.parse(localStorage.getItem(interactionKey(story))||'null'):null;
         const clearPendingCardInteraction = () => {
+            const story=getCurrentStoryBranchScopeId();
+            if(story && readInteraction(story))localStorage.removeItem(interactionKey(story));
             pendingCardInteraction.value = '';
         };
+        watch([getCurrentStoryBranchScopeId,chatHistory],([story,history])=>{
+            const saved=readInteraction(story);
+            pendingCardInteraction.value=saved && !history.some(m=>m.id===saved.id)?saved.text:'';
+        },{flush:'post'});
         const removePendingChatImage = (id) => {
             pendingChatImages.value = pendingChatImages.value.filter(image => image.id !== id);
         };
@@ -3606,7 +3504,7 @@ const app = createApp({
         };
 
         const openLocalArchives = async (page) => {
-            const destination = page === 'private.html' ? page : 'local.html';
+            const destination = page === 'private.html' ? page : page==='gallery'?'local.html#gallery':'local.html';
             if (isConversationBusy.value) return showToast('请等待当前回复结束后再管理存档', 'info');
             try {
                 if (!_initComplete) { location.assign(destination); return; }
@@ -3616,20 +3514,24 @@ const app = createApp({
         };
 
         const sendMessage = async () => {
+            if (!_initComplete || _isApplyingCharacterScopedData || !currentCharacter.value) {
+                showToast(currentCharacter.value?'正在读取当前进度':'请先选择角色', 'warning');return;
+            }
             if ((!userInput.value.trim() && pendingChatImages.value.length === 0 && !pendingCardInteraction.value) || isConversationBusy.value || pendingChatImageReadCount.value > 0) return;
 
             const content = userInput.value.trim();
             const cardInteraction = pendingCardInteraction.value;
             const imageAttachments = pendingChatImages.value.map(({ dataUrl }) => ({ dataUrl }));
             const startTime = Date.now(); // Record click time
+            const story=getCurrentStoryBranchScopeId(),draft=readInteraction(story);
             userInput.value = '';
-            clearPendingCardInteraction();
+            pendingCardInteraction.value='';
             clearPendingChatImages();
 
             let finalContent = content;
             if (cardInteraction) {
                 chatHistory.value.push({
-                    id: generateUUID(),
+                    id: draft?.id || generateUUID(),
                     role: 'user',
                     content: cardInteraction,
                     isSelf: true,
@@ -3655,6 +3557,7 @@ const app = createApp({
             savingUserMessage.value = true;
             try {
                 if (!await saveChatHistoryNow()) return;
+                if(cardInteraction && draft && readInteraction(story)?.id===draft.id)localStorage.removeItem(interactionKey(story));
             } finally {
                 savingUserMessage.value = false;
             }
@@ -4705,12 +4608,15 @@ const app = createApp({
                 if (isContinuation) activeToolContinuationHasResponse.value = true;
             };
 
+            const cloudJob=window.RPPrivateSync?.mode()==='auto' && !activeToolDepth && !continuingAssistantMessage && chatHistory.value.at(-1)?.role==='user'
+                ? {id:crypto.randomUUID(),story:getCurrentStoryBranchScopeId(),message:chatHistory.value.at(-1).id} : null;
             const createAssistantMessage = (content = '', reasoning = '') => reactive({
                 role: 'assistant',
                 name: currentCharacter.value.name,
                 content: content || '',
                 reasoning: reasoning || '',
-                id: generateUUID(),
+                id: cloudJob?.id || generateUUID(),
+                ...(cloudJob ? {cloudPartial:true} : {}),
                 shouldAnimate: true,
                 isCotOpen: false,
                 isReasoningOpen: true,
@@ -4793,6 +4699,7 @@ const app = createApp({
                 let lastSegmentCommit = 0;
                 const responseResult = await requestTrackedChatCompletion({
                     model: requestModel,
+                    backgroundJob: cloudJob,
                     messages: apiMessages,
                     onBeforeRequest: prepareRequest,
                     logResponse: true,
@@ -4870,6 +4777,8 @@ const app = createApp({
 
                 if (assistantMessage) {
                     generatedAssistantMessageId = assistantMessage.id;
+                    if(cloudJob)delete assistantMessage.cloudPartial;
+                    freezeImagePlan(assistantMessage);
                     if (!toolResponse && settings.uiTemplateEnabled && settings.uiTemplateMainModelAnalysis) {
                         applyMainModelUiTemplateUpdates(assistantMessage, requestModel);
                     }
@@ -4892,7 +4801,9 @@ const app = createApp({
                     isGenerating.value = false;
                     isThinking.value = false;
                 }
-                if (targetMessage) {
+                if(error.backgroundJob && !cancelled){
+                    showToast('后台回复暂未接续，可在私人站点查看任务和已收内容','warning');
+                } else if (targetMessage) {
                     appendAssistantResponseError(targetMessage, errorMessage);
                     if (continuingAssistantMessage) activeToolContinuationHasResponse.value = true;
                 } else {
@@ -6702,15 +6613,9 @@ const app = createApp({
         };
 
         const enforceSpecialRules = () => {
-            const imageGenToken = settings.imageGenKey.trim();
-            const baseUrl = IMAGE_GEN_BASE_URL;
-
             // 1. NAI画图正则 (统一版本)
             const imageGenRegexName = 'NAI画图正则';
-            const targetArtists = cardUtils.getImageStyleArtists(settings.imageStyle, settings.customImageArtists);
-
-            const encodedTargetArtists = encodeURIComponent(targetArtists);
-            const imageRequestUrl = `${baseUrl}/generate?tag=$1&token=${encodeURIComponent(imageGenToken)}&model=${settings.imageModel}&artist=${encodedTargetArtists}&size=${settings.imageSize}&steps=40&scale=6&cfg=0&sampler=k_dpmpp_2m_sde&negative={{{{bad anatomy}}}},{bad feet},bad hands,{{{bad proportions}}},{blurry},cloned face,cropped,{{{deformed}}},{{{disfigured}}},error,{{{extra arms}}},{extra digit},{{{extra legs}}},extra limbs,{{extra limbs}},{fewer digits},{{{fused fingers}}},gross proportions,ink eyes,ink hair,jpeg artifacts,{{{{long neck}}}},low quality,{malformed limbs},{{missing arms}},{missing fingers}},{{missing legs}},{{{more than 2 nipples}}},mutated hands,{{{mutation}}},normal quality,owres,{{poorly drawn face}},{{poorly drawn hands}},reen eyes,signature,text,{{too many fingers}},{{{ugly}}},username,uta,watermark,worst quality,{{{more than 2 legs}}},awkward hand sign,weird hand gesture,contorted hand,unnatural finger pose,deformed hand gesture,{shaka},{hang loose},{{rock on}},{shaka sign}&nocache=0&noise_schedule=karras`;
+            const imageRequestUrl=imageRequest();
             const imageGenRegexContent = {
                 name: imageGenRegexName,
                 regex: getImageTagRegex().toString(),
@@ -6795,7 +6700,7 @@ const app = createApp({
             });
 
         const createInitialChatHistory = (char) => char?.first_mes ? [{
-            role: 'assistant',
+            id:'opening-'+char.uuid,...(/image###/i.test(char.first_mes)?{rphImagePlan:imagePlan()}:{}),role: 'assistant',
             name: char.name,
             content: char.first_mes
         }] : [];
@@ -6823,6 +6728,12 @@ const app = createApp({
             if (savedChat.some(message => message !== null && (typeof message !== 'object' || Array.isArray(message)))) {
                 throw new TypeError('保存的聊天记录包含无效消息');
             }
+            const templates=[...ensureGlobalUiTemplates(),...(char?.uiTemplates||[])].filter(t=>t.enabled!==false);
+            if(templates.some(t=>t.id===RPFateSaves.template)){
+                for(const msg of savedChat){const token=RPFateSaves.turn(msg,templates);if(token)msg.rphFateTurn=token;}
+                await RPFateSaves.inherit(storyScopeId,RPFateSaves.dbName,savedChat,templates);
+            }
+            savedChat.forEach((msg,index)=>{if(msg && !msg.id && /image###/i.test(msg.content||''))msg.id='legacy-image-'+index;});
             return savedChat.length > 0
                 ? prepareLoadedChatHistoryForDisplay(savedChat)
                 : createInitialChatHistory(char);
@@ -7073,6 +6984,8 @@ const app = createApp({
                 const floorCount = postprocessChatHistory(sourceChatHistory, { includeSystem: false }).length;
                 const wordCount = getConversationBodyLength(sourceChatHistory);
 
+                await RPImages.fork(parentScopeId,branchScopeId,sourceChatHistory);
+                await RPFateSaves.inherit(branchScopeId,RPFateSaves.name(parentScopeId),sourceChatHistory,activeUiTemplates.value);
                 await setScopedStoredValue('chat', branchScopeId, cloneForStorage(sourceChatHistory), { clone: false });
                 await setScopedStoredValue('classic_memories', branchScopeId, cloneForStorage(branchClassicMemories), { clone: false });
 
@@ -7151,7 +7064,7 @@ const app = createApp({
             const target = storyBranches.value.find(branch => branch.id === branchId);
             if (!char?.uuid || !target || branchId === activeStoryBranchId.value || storyBranchSwitching.value) return;
             clearPendingChatImages();
-            clearPendingCardInteraction();
+            pendingCardInteraction.value='';
             storyBranchSwitching.value = true;
             try {
                 if (!await saveCurrentStoryBranchState()) return;
@@ -7236,7 +7149,7 @@ const app = createApp({
                 return true;
             }
             clearPendingChatImages();
-            clearPendingCardInteraction();
+            pendingCardInteraction.value='';
             const switchEpoch = ++_characterSwitchEpoch;
             const isLatestSwitch = () => switchEpoch === _characterSwitchEpoch;
             switchingCharacterIndex.value = index;
@@ -7752,12 +7665,48 @@ const app = createApp({
                 return;
             }
 
+            const story=getCurrentStoryBranchScopeId();
+            if(!story)return;
+            localStorage.setItem(interactionKey(story),JSON.stringify({id:generateUUID(),text:command}));
             pendingCardInteraction.value = command;
             await nextTick();
             inputBox.value?.focus();
         };
 
         // Lifecycle
+        let observingJob=false;
+        async function resumeCloudReply(){
+            if(observingJob || document.hidden || window.RPPrivateSync?.mode()!=='auto' || window.RPGameBusy() || !currentCharacter.value)return;
+            const story=getCurrentStoryBranchScopeId(), tail=chatHistory.value.at(-1);
+            if(!tail || (tail.role!=='user' && !tail.cloudPartial))return;
+            observingJob=true;
+            try{
+                const jobs=await RPPrivateJobs.list();
+                const job=jobs.find(j=>j.story===story && j.branch===RPPrivateSync.branch && (j.message===tail.id || j.id===tail.id));
+                if(!job || getCurrentStoryBranchScopeId()!==story || chatHistory.value.at(-1)?.id!==tail.id || window.RPGameBusy())return;
+                const active=()=>getCurrentStoryBranchScopeId()===story && window.RPPrivateSync.mode()==='auto' && !isGenerating.value && [tail.id,job.id].includes(chatHistory.value.at(-1)?.id);
+                let content='',reasoning='';
+                const apply=async partial=>{
+                    if(!active())return;
+                    let msg=chatHistory.value.at(-1);
+                    if(msg.id!==job.id){msg=reactive({id:job.id,role:'assistant',name:currentCharacter.value.name,skipReveal:true});chatHistory.value.push(msg);}
+                    Object.assign(msg,{content,reasoning,cloudPartial:partial});
+                    if(!partial)freezeImagePlan(msg);
+                    if(!partial && settings.uiTemplateEnabled && settings.uiTemplateMainModelAnalysis)
+                        applyMainModelUiTemplateUpdates(msg,settings.model);
+                    await saveChatHistoryNow();
+                };
+                try{
+                    const result=await RPPrivateJobs.replay(job,undefined,delta=>{content+=delta.content||'';reasoning+=delta.reasoning||'';});
+                    content=result.content;reasoning=result.reasoning;
+                    if(result.toolCalls?.length && !content)content='此回复包含工具请求，可在原设备继续。';
+                    await apply(false);
+                }catch(e){if(content||reasoning)await apply(true);if(active())showToast(e.message,'warning');}
+            }catch(e){console.warn('后台回复暂未接续',e.message);}finally{observingJob=false;}
+        }
+        window.addEventListener('online',resumeCloudReply);
+        document.addEventListener('visibilitychange',resumeCloudReply);
+        watch(currentCharacterIndex,()=>setTimeout(resumeCloudReply,1200));
         onMounted(async () => {
             window.addEventListener('rph-storage-warning', event => showToast(event.detail, 'warning', 6000));
             document.addEventListener('fullscreenchange', syncChatFullscreenState);
@@ -7868,6 +7817,7 @@ const app = createApp({
                 if (!existingCotPreset) {
                     presets.value.push({
                         name: cotPresetName,
+                        role: 'system',
                         content: cotPresetContent,
                         enabled: true
                     });
@@ -7906,9 +7856,6 @@ const app = createApp({
                 () => presets.value.find(preset => preset.name === cotPresetName)?.enabled
             ], syncDynamicPresetContent);
             removeLegacyUserRegex();
-
-            // Save enforced defaults immediately (仅保存预设/正则等结构性数据)
-            await saveData({ saveMemories: false, saveCharacters: false, skipChat: true, propagate: true });
 
             // 初始化守卫解除：此后 saveData 才允许写入 user / memorySettings
             _initComplete = true;
@@ -7965,6 +7912,10 @@ const app = createApp({
                 selectCharacter(0);
             }
 
+            // Persist the chosen character's presets after its templates are active.
+            syncDynamicPresetContent();
+            await saveData({ startup: true, saveMemories: false, saveCharacters: false, skipChat: true, propagate: true });
+
             // Local startup does not contact model or image providers. Settings retain explicit connection checks.
 
             // --- Mobile Keyboard Adaptation (VisualViewport) ---
@@ -7998,7 +7949,7 @@ const app = createApp({
         onBeforeUnmount(() => {
             activeSortable?.destroy();
             generatedImageObserver?.disconnect();
-            generatedImageTasks.clear();
+            for(const card of imageUrls.keys())forgetImage(card);
             closeNavigation();
             document.removeEventListener('fullscreenchange', syncChatFullscreenState);
             document.removeEventListener('webkitfullscreenchange', syncChatFullscreenState);
@@ -8252,7 +8203,7 @@ const app = createApp({
             editorTab, characterDisplayLimit, hasOpenedCharacterManager, isDesktopCharacterLayout, characterGridView, characterDeck, useCharacterDeck, displayedCharacters, loadMoreCharacters, getCharacterWICount, getCharacterRegexCount,
             isAutoImageGenEnabled,
             apiStatus, apiLatency, imageGenStatus, imageGenLatency, checkAllStatuses, // Status Exports
-            toggleAutoImageGen, setWorldInfoEnabled, handleGeneratedImageReroll,
+            toggleAutoImageGen, setWorldInfoEnabled, handleGeneratedImageReroll,providerChoices,serviceKey,getCurrentStoryBranchScopeId,
             quotaValue, quotaLoading, quotaError,
             // Memory System Exports
             classicMemoryPage, classicMemoryPageCount, memorySettings, retryingClassicMemoryId, retryClassicMemory,
@@ -8281,7 +8232,7 @@ const app = createApp({
             copyMessage, playMessageActionFeedback, canDeleteMessage, deleteMessage, regenerateMessage,
             editMessage, saveEditMessage, cancelEditMessage,
             createNewCharacter, editCharacter, saveCharacter, deleteCharacter, selectCharacter, toggleCharacterFavorite, isCharacterFavorite,
-            currentUiTemplates, activeUiTemplates, uiTemplateUpdateStatus, createUiTemplate, editUiTemplate, saveUiTemplate, deleteUiTemplate, importUiTemplates, updateUiTemplatesFromChat, renderEditingUiTemplatePreview, handleUiTemplateClick,
+            currentUiTemplates, activeUiTemplates, fateSyncLabel, uiTemplateUpdateStatus, createUiTemplate, editUiTemplate, saveUiTemplate, deleteUiTemplate, importUiTemplates, updateUiTemplatesFromChat, renderEditingUiTemplatePreview, handleUiTemplateClick,
             isBatchDeleteMode, isNavigationOpen, selectedCharacterIndices, toggleBatchDeleteMode, toggleCharacterSelection, batchDeleteCharacters,
             handleAvatarUpload, importCharacter,
             createPreset, editPreset, savePreset, deletePreset,

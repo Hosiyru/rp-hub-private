@@ -4,37 +4,45 @@
     const archive=RPLocalArchive, {decode,encode,hash}=archive.codec;
     const chunkSize=2*1024*1024;
     const secret=/^(api[_-]?key|apiProviderKeys|imageGenKey|access[_-]?token|refresh[_-]?token|authorization|password|client[_-]?secret|embeddingApiKey|customApiKey|tavilyApiKey)$/i;
-    function scrub(value) {
+    const legacyImageKey=/^(rp_hub_image_gen_key_v1|rphImgKeyShadow)$/i;
+    function scrub(value,imageParams=false) {
         if(typeof value==='string') return value.replace(/([?&](?:token|api_key|apikey|access_token)=)[^&#"'\s<>]*/gi,'$1');
-        if(Array.isArray(value))return value.map(scrub);
+        if(Array.isArray(value))return value.map(item=>scrub(item,imageParams));
         if(!value || Object.getPrototypeOf(value)!==Object.prototype)return value;
-        return Object.fromEntries(Object.entries(value).map(([k,v])=>[k,secret.test(k)?(typeof v==='object'&&v?{}:''):scrub(v)]));
+        return Object.fromEntries(Object.entries(value).map(([k,v])=>[k,(secret.test(k)||(imageParams && k.toLowerCase()==='token'))?(typeof v==='object'&&v?{}:''):scrub(v,imageParams)]));
     }
     function scrubSetting(key,value) {
-        if(secret.test(key)||/ai_chargen_api|cloud_backup/i.test(key))return '';
-        try{return JSON.stringify(scrub(JSON.parse(value)));}catch{return scrub(value);}
+        if(secret.test(key)||legacyImageKey.test(key)||/ai_chargen_api|cloud_backup/i.test(key))return '';
+        try{const parsed=JSON.parse(value),clean=JSON.stringify(scrub(parsed));return clean===JSON.stringify(parsed)?value:clean;}catch{return scrub(value);}
     }
-    async function capture() {
-        const pkg=await archive.portable(RPLocalScope.id);
-        const run=pkg.body.runs[0], blocks={}, mapped=new Map();
-        for(const state of [run.state,...run.points.map(p=>p.state)]){
+    async function forTransfer(pkg) {
+        const blocks={}, mapped=new Map();
+        for(const run of pkg.body.runs)for(const state of [run.state,...run.points.map(p=>p.state)]){
             state.storage=state.storage.map(([k,v])=>[k,scrubSetting(k,v)]);
             for(const db of state.dbs)for(const store of db.stores)for(const row of store.rows){
                 const old=row[1];
-                if(!mapped.has(old)){
+                const imageBucket=db.name==='RPHubDB' && typeof row[0]==='string' && row[0].startsWith('rp_hub_image_renders_');
+                const imageKey=db.name==='RPHubDB' && legacyImageKey.test(row[0]);
+                const cacheKey=(imageBucket?'image/':imageKey?'key/':'')+old;
+                if(!mapped.has(cacheKey)){
                     const text=pkg.body.blocks[old];
                     // Never rewrite binary records simply to sanitize a model setting.
                     let next=text;
-                    if(/api.?key|apiProviderKeys|imageGenKey|access.?token|refresh.?token|authorization|password|client.?secret|[?&]token=/i.test(text))
-                        next=JSON.stringify(await encode(scrub(decode(JSON.parse(text)))));
+                    if(imageKey)next=JSON.stringify('');
+                    else if(imageBucket||/api.?key|apiProviderKeys|imageGenKey|access.?token|refresh.?token|authorization|password|client.?secret|[?&]token=/i.test(text))
+                        next=JSON.stringify(await encode(scrub(decode(JSON.parse(text)),imageBucket)));
                     const key=next===text?old:await hash(next);
-                    blocks[key]=next;mapped.set(old,key);
+                    blocks[key]=next;mapped.set(cacheKey,key);
                 }
-                row[1]=mapped.get(old);
+                row[1]=mapped.get(cacheKey);
             }
         }
         pkg.body.blocks=blocks;
         pkg.digest=await hash(JSON.stringify(pkg.body));
+        return pkg;
+    }
+    async function capture(){
+        const pkg=await forTransfer(await archive.portable(RPLocalScope.id));
         return {pkg,summary:describe(pkg)};
     }
     function describe(pkg) {
@@ -109,5 +117,42 @@
             return {imported,mode:work.mode};
         });
     }
-    window.RPFirstConnection={capture,meaningful,migrate,pending:key=>pending(key,'get')};
+    // Restore only device-local credential fields for settings that already exist on this device.
+    function overlay(remote,local){
+        if(Array.isArray(remote))return remote.map(v=>{
+            const match=v && typeof v==='object' && (v.id||v.uuid) && Array.isArray(local) && local.find(x=>x && (x.id||x.uuid)===(v.id||v.uuid));
+            return match?overlay(v,match):v;
+        });
+        if(!remote || Object.getPrototypeOf(remote)!==Object.prototype || !local || typeof local!=='object')return remote;
+        const endpoints=new Set([...Object.keys(remote),...Object.keys(local)].filter(k=>/url|endpoint|host|providerid/i.test(k)));
+        if([...endpoints].some(k=>remote[k]!==local[k]))return remote;
+        return Object.fromEntries(Object.entries(remote).map(([k,v])=>[k,secret.test(k) && Object.hasOwn(local,k)?local[k]:overlay(v,local[k])]));
+    }
+    async function retainDeviceSettings(pkg){
+        const state=pkg.body.runs[0].state;
+        for(const item of state.storage){
+            const [k,v]=item,local=localStorage.getItem(k);if(local===null)continue;
+            if(secret.test(k)||/ai_chargen_api|cloud_backup/i.test(k))continue;
+            if(!/setting|provider|config/i.test(k))continue;
+            try{item[1]=JSON.stringify(overlay(JSON.parse(v),JSON.parse(local)));}catch{}
+        }
+        const candidates=state.dbs.find(db=>db.name==='RPHubDB')?.stores.find(s=>s.name==='store')?.rows.filter(([k])=>typeof k==='string' && /setting|provider|config/i.test(k))||[];
+        if(!candidates.length)return pkg;
+        const physical=(RPLocalScope.id==='main'?'':RPLocalScope.prefix+RPLocalScope.id+'/')+'RPHubDB';
+        if(!(await RPLocalScope.factory.databases()).some(db=>db.name===physical))return pkg;
+        const request=r=>new Promise((ok,no)=>{r.onsuccess=()=>ok(r.result);r.onerror=()=>no(r.error);});
+        const db=await request(RPLocalScope.factory.open(physical));
+        try{
+            if(!db.objectStoreNames.contains('store'))return pkg;
+            const s=db.transaction('store').objectStore('store');
+            const values=await Promise.all(candidates.map(([k])=>request(s.get(k))));
+            for(const [i,row] of candidates.entries())if(values[i]){
+                const merged=overlay(decode(JSON.parse(pkg.body.blocks[row[1]])),values[i]);
+                const text=JSON.stringify(await encode(merged)),id=await hash(text);
+                pkg.body.blocks[id]=text;row[1]=id;
+            }
+        }finally{db.close();}
+        return pkg;
+    }
+    window.RPFirstConnection={capture,meaningful,migrate,forTransfer,retainDeviceSettings,pending:key=>pending(key,'get')};
 })();

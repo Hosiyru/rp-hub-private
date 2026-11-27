@@ -19,16 +19,25 @@
 <div id="redeemRow" hidden><p>二维码可一次性登录到签发它的账号。请核对上方站点地址。</p><button id="redeem" class="primary">使用配对码登录此站</button></div></section>
 <section id="account" hidden><h2 id="identity">本站账号</h2><div class="row actions"><button id="pair">生成手机配对码</button><button id="invite" hidden>生成邀请码</button><button id="logout">解绑此设备</button></div>
 <div id="ticketBox" hidden><img id="qr" width="224" height="224" alt="手机一次性登录二维码"><p id="ticketInfo"></p><button id="copyTicket">复制</button><button id="hideTicket">收起</button></div></section>
+<section id="sync" hidden><h2>继续游玩</h2><label for="syncMode">此设备的同步方式</label><select id="syncMode"><option value="manual">手动</option><option value="auto">自动接续</option></select>
+<p>自动模式下，私人站点可代为生成普通聊天回复，模型密钥加密保存在本站。</p><p id="syncState" role="status"></p><div class="row actions"><button id="push">上传本机进度</button><button id="pull">拉取并打开云档</button><button id="listBranches">查看云端分支</button></div><label id="branchRow" hidden>要打开的分支<select id="branches"></select></label></section>
+<section id="jobs" hidden><h2>后台生成</h2><button id="loadJobs">查看本站任务</button><div id="jobList"></div><pre id="jobOutput" aria-live="polite" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre></section>
 <section id="migration" hidden><h2>首次迁入</h2><p>先看两边各有什么。确认后，本机进度在云端另存一份，选中的云档在本机另开进度。</p>
 <button id="preview">比较本机与云端</button><button id="resume" hidden>继续上次中断的迁入</button>
 <div id="comparison" hidden><h3>本机当前进度</h3><p id="localSummary"></p><h3>本站云档</h3><div id="cloudList"></div>
-<label for="mode">本设备后续同步方式</label><select id="mode"><option value="manual">手动</option><option value="auto">自动（记录偏好，第四阶段启用）</option></select>
+<label for="mode">本设备后续同步方式</label><select id="mode"><option value="manual">手动</option><option value="auto">自动接续</option></select>
 <div class="row actions"><button id="confirm" class="primary">保留双方并迁入</button><button id="cancel">取消</button></div></div>
 <div id="result"></div></section>
+<section id="siteRelease" hidden aria-labelledby="releaseTitle"><h2 id="releaseTitle">站点版本</h2>
+<p id="releaseCurrent"></p><button type="button" id="releaseCheck">检查新版</button>
+<button type="button" id="releaseInstall" hidden>更新本站</button>
+<p id="releaseState" role="status" aria-live="polite"></p></section>
 <section id="health" hidden><h2>部署验证</h2><p>用一条测试记录核对 D1、私有 R2 和队列读写。</p><button id="probe">检查本站绑定</button></section>
 <p role="status" aria-live="polite" id="status"></p>
 </main>
 <script src="assets/js/local-scope.js"></script><script src="assets/js/local-library.js"></script>
 <script src="assets/js/local-archive.js"></script><script src="assets/js/private-archives.js"></script>
+<script src="assets/js/fate-saves.js"></script><script src="assets/js/private-api.js"></script><script src="assets/js/sync-format.js"></script><script src="assets/js/private-sync.js"></script>
+<script src="assets/js/built-in-content.js"></script><script src="assets/js/core-utils.js"></script><script src="assets/js/api-utils.js"></script><script src="assets/js/private-jobs.js"></script>
 <script src="assets/vendor/qrcode.js"></script><script src="assets/vendor/jsQR.js"></script>
 <script src="assets/js/private-site.js"></script></body></html>

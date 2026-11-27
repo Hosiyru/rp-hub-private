@@ -4,6 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <script src="assets/js/local-scope.js"></script>
+    <script src="assets/js/fate-saves.js"></script>
     <script src="assets/js/theme.js"></script>
     <meta name="viewport"
         content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, interactive-widget=resizes-content">
@@ -77,6 +78,7 @@
         </div>
     </div>
 
+    <dialog id="originalImageDialog" aria-label="原图"><img alt=""><form method="dialog"><button type="submit" autofocus>关闭原图</button></form></dialog>
     <div id="app" v-cloak class="h-full flex flex-col md:flex-row relative"
         :class="{ 'app-native-fullscreen': isChatFullscreen, 'mobile-keyboard-active': isMobileKeyboardOpen }">
         <component is="style" v-if="settings.fontSize">
@@ -221,8 +223,9 @@
                                 @click="showDescriptionPanel = !showDescriptionPanel">
                                 <img :src="currentCharacterAvatar"
                                     class="w-9 h-9 rounded-full object-cover border border-white/20 shadow-sm flex-shrink-0">
-                                <span class="ml-2 font-medium text-white truncate drop-shadow-md">{{
-                                    currentCharacter.name }}</span>
+                                <span class="ml-2 min-w-0 text-white drop-shadow-md"><span class="block truncate font-medium">{{ currentCharacter.name }}</span>
+                                    <small v-if="activeUiTemplates.some(t=>t.id==='fate_moment_rebuild')" class="block truncate text-[10px]" role="status">{{ fateSyncLabel }}</small>
+                                </span>
                                 <button
                                     class="ml-1 p-1.5 text-white/60 hover:text-white hover:bg-white/20 rounded-full transition-all flex-shrink-0"
                                     :class="{'bg-white/20 text-white': showDescriptionPanel}">
@@ -278,10 +281,10 @@
                     </div>
 
                     <template v-if="currentCharacter && chatHistory.length > 0">
-                    <template v-for="({ msg, index }, displayIndex) in displayedChatMessages" :key="index">
+                    <template v-for="({ msg, index }, displayIndex) in displayedChatMessages" :key="getCurrentStoryBranchScopeId() + '/' + (msg.id || index)">
                     <div ref="messageElements"
                         :data-role="msg.role"
-                        :data-chat-index="index"
+                        :data-chat-index="index" :data-message-id="msg.id"
                         v-show="!(msg.role === 'assistant' && index === chatHistory.length - 1 && isThinking && !(msg.reasoning || parseCot(msg.content).cot || parseCot(msg.content).main || (msg.toolCalls && msg.toolCalls.length)))"
                         :class="['flex w-full scroll-reveal-container', settings.immersiveMode ? 'immersive-message-row' : 'standard-message-row', msg.isSelf ? 'justify-end' : 'justify-start', msg.skipReveal ? 'reveal-active' : (settings.immersiveMode ? 'scroll-reveal-center' : (msg.isSelf ? 'scroll-reveal-right' : 'scroll-reveal-left'))]"
                         :style="{ transitionDelay: (displayIndex % 5) * 50 + 'ms' }">
@@ -1538,6 +1541,21 @@
                                                 placeholder="STA1N密钥/NAI官方密钥"></secret-input>
                                         </div>
 
+                                        <div><label for="image-generator" class="settings-label">生图服务</label><select id="image-generator" v-model="settings.imageGenerator" class="settings-control"><option v-for="p in providerChoices" :value="p.id">{{ p.label }}</option></select></div>
+                                        <template v-if="settings.imageGenerator==='compatible'">
+                                            <div><label for="image-service" class="settings-label">接口根地址</label><input id="image-service" type="url" v-model.trim="settings.imageServiceUrl" class="settings-control" placeholder="https://…/v1"></div>
+                                            <div><label for="image-service-model" class="settings-label">图片模型</label><input id="image-service-model" v-model.trim="settings.imageServiceModel" class="settings-control"></div>
+                                            <div><label for="image-service-key" class="settings-label">此设备的接口密钥</label><input id="image-service-key" type="password" autocomplete="off" v-model="serviceKey" class="settings-control"></div>
+                                        </template>
+                                        <details v-if="settings.imageGenerator==='jobs'"><summary>生图参数</summary>
+                                            <label>生成步数<input class="settings-control" type="number" min="1" max="28" v-model.number="settings.imageSteps"></label>
+                                            <label>提示词引导值<input class="settings-control" type="number" min="0" max="10" step=".1" v-model.number="settings.imageScale"></label>
+                                            <label>缩放引导值<input class="settings-control" type="number" min="0" max="1" step=".02" v-model.number="settings.imageCfg"></label>
+                                            <label>采样器<select class="settings-control" v-model="settings.imageSampler"><option v-for="s in ['k_euler','k_euler_ancestral','k_dpmpp_2s_ancestral','k_dpmpp_2m','k_dpmpp_2m_sde','k_dpmpp_sde']">{{ s }}</option></select></label>
+                                            <label>噪声调度<select class="settings-control" v-model="settings.imageNoise"><option v-for="s in ['karras','native','exponential','polyexponential']">{{ s }}</option></select></label>
+                                            <label>分辨率<select class="settings-control" v-model="settings.imageResolution"><option value="">标准</option><option>2K</option><option>4K</option></select></label>
+                                            <label>负面提示词<textarea class="settings-control" v-model="settings.imageNegative" placeholder="留空使用默认值"></textarea></label>
+                                        </details>
                                         <!-- Image Model -->
                                         <div class="min-w-0">
                                             <label
@@ -1668,7 +1686,7 @@
                                 </div>
                             </div>
 
-                            <section class="pt-6 border-t border-gray-100 mt-6"><h4 class="settings-subheading mb-4">本地存档</h4><button type="button" @click="openLocalArchives" class="settings-action min-h-[2.875rem]">管理存档点与换机档案</button> <button type="button" @click="openLocalArchives('private.html')" class="settings-action min-h-[2.875rem]">私人站点与登录</button></section>
+                            <section class="pt-6 border-t border-gray-100 mt-6"><h4 class="settings-subheading mb-4">本地存档</h4><button type="button" @click="openLocalArchives" class="settings-action min-h-[2.875rem]">管理存档点与换机档案</button> <button type="button" @click="openLocalArchives('gallery')" class="settings-action min-h-[2.875rem]">图库</button> <button type="button" @click="openLocalArchives('private.html')" class="settings-action min-h-[2.875rem]">私人站点与登录</button><p id="gameSyncState" role="status"></p></section>
                             <!-- Backup & Transfer: the details live in its dialog -->
                             <div v-if="cloudBackup.enabled" class="pt-6 border-t border-gray-100 mt-6">
                                 <h4 class="settings-subheading flex items-center mb-4">
@@ -2518,7 +2536,7 @@
 
     <script>
         (function (stamp) {
-            ['local-library', 'local-archive', 'local-native', 'built-in-content', 'core-utils', 'api-utils', 'data-services', 'runtime-services', 'cloud-backup',
+            ['local-library', 'local-archive', 'local-native', 'private-api', 'private-archives', 'sync-format', 'private-sync', 'private-jobs', 'image-library', 'image-provider', 'built-in-content', 'core-utils', 'api-utils', 'data-services', 'runtime-services', 'cloud-backup',
                 'update-check', 'ui-components', 'app'].forEach(name => {
                 document.write('<script src="assets/js/' + name + '.js?v=' + stamp + '"><\/script>');
             });

@@ -10,7 +10,10 @@
     const logical = name => name.slice(namespace.length);
     const keys = () => Object.keys(disk).filter(visible).map(logical);
     const revisionKey = '__rph_revision_' + id;
-    function changed() { disk.setItem(revisionKey,crypto.randomUUID()); window.RPLocalNative?.dirty(); }
+    function changed() {
+        disk.setItem(revisionKey,crypto.randomUUID()); window.RPLocalNative?.dirty();
+        window.dispatchEvent(new Event('rph-local-change'));
+    }
     const dbRegistry = '__rph_registered_db_'+id, keyRegistry = '__rph_registered_keys_'+id;
     const retain = (registry, name) => {
         const items = JSON.parse(disk.getItem(registry) || '[]');
@@ -45,9 +48,15 @@
         databases: async () => (await factory.databases()).filter(d => visible(d.name)).map(d => ({...d, name:logical(d.name)}))
     };
     const install = target => {
-        Object.defineProperty(target, 'indexedDB', { configurable:true, value:scoped });
+        Object.defineProperty(target, 'indexedDB', { configurable:true, get:()=>window.RPFateSaves?.factory(scoped)||scoped });
         Object.defineProperty(target, 'localStorage', { configurable:true, value:storage });
     };
     install(window);
-    window.RPLocalScope = { id, install, factory, disk, catalog, prefix, activeKey };
+    // A second open tab keeps its active namespace alive during automatic replica rotation.
+    if(window===top && navigator.locks){
+        let release;
+        const hold=()=>navigator.locks.request('rph-live/'+id,{mode:'shared'},()=>new Promise(ok=>{release=ok;}));
+        hold();window.addEventListener('pagehide',()=>release?.());window.addEventListener('pageshow',e=>{if(e.persisted)hold();});
+    }
+    window.RPLocalScope = { id, changed, install, factory, storageFactory:scoped, disk, catalog, prefix, activeKey };
 })();

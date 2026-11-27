@@ -1,10 +1,10 @@
 /* The APK ships these assets in its package. A hosted copy retains the same shell after the first online visit. */
-const cacheName='rph-local-shell-3.0.1';
+const cacheName='rph-local-shell-0.6.2-updates';
 const shell=[
     'index.html','local.html','private.html','deploy.html','character/index.html','novel/index.html',
     ...['theme','styles','local','private'].map(n=>'assets/css/'+n+'.css'),
     ...['theme','tailwind-theme','built-in-content','core-utils','api-utils','data-services','runtime-services',
-        'cloud-backup','update-check','ui-components','app','local-scope','local-library','local-archive','local-native','local-panel','private-site','private-archives','deploy'].map(n=>'assets/js/'+n+'.js'),
+        'cloud-backup','update-check','ui-components','app','local-scope','local-library','local-archive','local-native','local-panel','legacy-shards','private-site','private-archives','private-api','fate-saves','sync-format','private-sync','private-jobs','image-library','image-provider','gallery','deploy'].map(n=>'assets/js/'+n+'.js'),
     ...['vue.global.prod.js','tailwind.js','marked.min.js','purify.min.js','sortable.min.js',
         'qrcode.js','jsQR.js','jquery.min.js','daisyui.min.css','localforage.min.js'].map(n=>'assets/vendor/'+n)
 ].map(s=>new URL(s,self.registration.scope).href);

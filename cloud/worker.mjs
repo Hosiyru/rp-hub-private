@@ -1,3 +1,6 @@
+import {generationRoute,consumeGeneration,recoverGeneration} from './generation.mjs';
+import {updateRoute,installed} from './updates.mjs';
+import {syncRoute} from './sync.mjs';
 const APK = 'https://rphub.local';
 const PREFIX = '/api/private/v1';
 const HEX = /^[a-f0-9]{64}$/;
@@ -48,7 +51,7 @@ async function handle(req,env) {
     const keyHash=(purpose,value)=>sha(site+'/'+purpose+'/'+value);
     if(path==='/site' && method==='GET'){
         const owner=await db.prepare("SELECT 1 AS ok FROM accounts WHERE role='owner'").first();
-        return json({service:'rp-hub-private',version:1,site,claimed:!!owner});
+        return json({service:'rp-hub-private',version:1,syncVersion:1,gameVersion:1,imageVersion:1,release:installed,site,claimed:!!owner});
     }
     if(req.headers.get('X-RP-Site')!==site) problem(409,'站点身份发生变化，请重新选择站点');
     const mint=async account=>{
@@ -94,7 +97,12 @@ async function handle(req,env) {
     const sessionHash=await keyHash('session',token);
     const a=await db.prepare('SELECT a.id,a.name,a.role FROM accounts a JOIN sessions s ON s.account=a.id WHERE s.token_hash=? AND s.expires>?').bind(sessionHash,now()).first();
     if(!a)problem(401,'登录已失效，请重新登录');
+    const expectedAccount=req.headers.get('X-RP-Account');
+    if(expectedAccount && expectedAccount!==a.id)problem(409,'当前登录账号已变化，请返回私人站点核对');
     if(path==='/me' && method==='GET')return json(a);
+    if(path==='/updates'||path==='/updates/latest')return updateRoute({env,req,path,role:a.role,readJson});
+    if(path==='/jobs'||path.startsWith('/jobs/'))return generationRoute({env,account:a.id,req,path,method,readJson,sha});
+    if(path==='/sync'||path.startsWith('/sync/'))return syncRoute({db,account:a.id,path,method,req,readJson,sha});
     if(path==='/logout' && method==='POST'){
         await db.prepare('DELETE FROM sessions WHERE token_hash=?').bind(sessionHash).run();
         return json({ok:true},200,mobile?{}:{'Set-Cookie':cookie('',0)});
@@ -177,17 +185,19 @@ export default {
         if(!url.pathname.startsWith(PREFIX+'/'))return env.ASSETS.fetch(req);
         let response;
         try{response=await handle(req,env);}
-        catch(e){response=json({error:e.status?e.message:'站点服务暂不可用，请检查绑定和数据库迁移'},e.status||503);}
+        catch(e){response=json({error:e.status?e.message:'站点服务暂不可用，请检查绑定和数据库迁移',official:e.official},e.status||503);}
         const h=response.headers;h.set('Cache-Control','no-store');h.set('Vary','Origin');h.set('X-Content-Type-Options','nosniff');
         if(req.headers.get('Origin')===APK){
-            h.set('Access-Control-Allow-Origin',APK);h.set('Access-Control-Allow-Headers','Content-Type,Authorization,X-RP-Site');
+            h.set('Access-Control-Allow-Origin',APK);h.set('Access-Control-Allow-Headers','Content-Type,Authorization,X-RP-Site,X-RP-Account');
             h.set('Access-Control-Allow-Methods','GET,POST,PUT,OPTIONS');
         }
         return response;
     },
+    async scheduled(_event,env){await recoverGeneration(env);},
     async queue(batch,env){
         for(const msg of batch.messages){
             if(msg.body?.type==='binding-check')await env.DB.prepare('UPDATE probes SET consumed=1 WHERE id=?').bind(msg.body.id).run();
+            if(msg.body?.type==='generation')await consumeGeneration(env,msg.body);
             msg.ack();
         }
     }

@@ -2071,6 +2071,11 @@ button.sortable-item-main:focus-visible { outline: 2px solid rgb(var(--primary-4
 .generated-image-progress-bar { display: block; width: 0; height: 100%; border-radius: inherit; background: #fff; transition: width 170ms linear; }
 .generated-image-card.is-generation-error :is(.generated-image-spinner, .generated-image-progress-track) { display: none; }
 
+.generated-image-open { display:block; width:100%; height:100%; padding:0; background:transparent; cursor:zoom-in; }
+#originalImageDialog { margin:auto; max-width:96vw; max-height:95vh; padding:0.75rem; border-radius:0.75rem; }
+#originalImageDialog img { display:block; max-width:90vw; max-height:80vh; object-fit:contain; }
+#originalImageDialog button { padding:0.5rem 0.75rem; }
+#originalImageDialog::backdrop { background:rgba(0,0,0,.72); }
 .generated-image-spinner { width: 72px; height: 72px; animation: generated-image-spinner-rotate 2s linear infinite; }
 .generated-image-spinner-path { stroke: #fff; stroke-linecap: round; animation: generated-image-spinner-dash 1.5s ease-in-out infinite; }
 .character-switch-spinner { width: 2.75rem; height: 2.75rem; }

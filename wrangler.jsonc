@@ -24,6 +24,7 @@
       "bucket_name": "rp-hub-private-archives"
     }
   ],
+  "triggers": {"crons":["*/5 * * * *"]},
   "queues": {
     "producers": [
       {
@@ -34,7 +35,7 @@
     "consumers": [
       {
         "queue": "rp-hub-private-jobs",
-        "max_batch_size": 10
+        "max_batch_size": 1
       }
     ]
   }

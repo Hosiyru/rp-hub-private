@@ -1,11 +1,11 @@
 {
   "name": "rp-hub-private-site",
-  "version": "0.3.0",
+  "version": "0.6.2",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "node cloud/build.mjs",
-    "deploy": "wrangler d1 migrations apply DB --remote && wrangler deploy",
+    "deploy": "node cloud/deploy.mjs",
     "dev:cf": "npm run build && wrangler d1 migrations apply DB --local && wrangler dev --local"
   },
   "devDependencies": {

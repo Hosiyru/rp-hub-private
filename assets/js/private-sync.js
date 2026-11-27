@@ -1,0 +1,254 @@
+(() => {
+    'use strict';
+    const scope=RPLocalScope, archive=RPLocalArchive, api=RPPrivateAPI, disk=scope.disk;
+    const revision=(id=scope.id)=>disk.getItem('__rph_revision_'+id)||'';
+    const accountKey=s=>s && !s.detached && s.account?[s.origin,s.site,s.account].join('/'):null;
+    const prefix=s=>'__rph_sync_'+accountKey(s)+'/';
+    const mode=(s=api.session())=>accountKey(s) && s.syncVersion===1 && disk.getItem(prefix(s)+'mode')==='auto'?'auto':'manual';
+    const base=(s,id=scope.id)=>JSON.parse(disk.getItem(prefix(s)+'base/'+id)||'null');
+    const setBase=(s,id,value)=>disk.setItem(prefix(s)+'base/'+id,JSON.stringify(value));
+    let timer,remoteHeads=[],message='本机已保存',activity=0,retry=1500;
+    const gameStatus=turns=>!turns?.length?'云端已确认':turns.some(t=>!t.record)?'正文已同步 · 游戏进度待齐':'游戏进度已同步';
+    function status(value){
+        message=value;
+        const game=document.getElementById('gameSyncState');if(game && accountKey(api.session()))game.textContent=value;
+        window.dispatchEvent(new Event('rph-sync-status'));
+    }
+    // Store an immutable outgoing commit before the first network write. Retries use the same parent.
+    let opening;
+    function cache() {
+        if(!opening)opening=new Promise((ok,no)=>{
+            const request=scope.factory.open('__rph_sync_cache',1);
+            request.onupgradeneeded=()=>{request.result.createObjectStore('parts');request.result.createObjectStore('outbox');};
+            request.onsuccess=()=>ok(request.result);request.onerror=()=>no(request.error);
+        });
+        return opening;
+    }
+    async function store(name,fn,write=false) {
+        const db=await cache();
+        return new Promise((ok,no)=>{
+            const tx=db.transaction(name,write?'readwrite':'readonly'), result=fn(tx.objectStore(name));
+            tx.oncomplete=()=>ok(result?.result);tx.onabort=()=>no(tx.error||Error('同步缓存写入失败'));
+        });
+    }
+    function context(automatic) {
+        const s=api.session(), key=accountKey(s);
+        if(!key)throw Error('请先登录私人站点');
+        function check() {
+            if(accountKey(api.session())!==key || (automatic && mode(s)!=='auto'))throw Error('同步已暂停');
+        }
+        return {s,key,check,call:(path,options)=>{check();return api.request(s,path,options);}};
+    }
+    const localKey=(c,id)=>c.key+'/'+id, partKey=(c,id)=>c.key+'/'+id;
+    async function capture(){
+        for(let attempt=0;;attempt++){
+            try{
+                const stamp=revision(), here=await RPFirstConnection.capture();
+                const packed=await RPSyncFormat.pack(here);
+                if(stamp!==revision())throw Object.assign(Error('进度正在写入，稍后重试'),{code:'SAVE_CHANGED'});
+                return {...packed,stamp,meaningful:RPFirstConnection.meaningful(here.summary)};
+            }catch(e){
+                if(e.code!=='SAVE_CHANGED' || attempt>=3)throw e;
+                await new Promise(ok=>setTimeout(ok,250*(attempt+1)));
+            }
+        }
+    }
+    async function provisionModel(c){
+        const saved=prefix(c.s)+'provider/'+scope.id;
+        if(disk.getItem(saved) || !window.RPHubApiUtils || !(await scope.storageFactory.databases()).some(d=>d.name==='RPHubDB'))return;
+        const req=scope.storageFactory.open('RPHubDB');
+        const db=await new Promise((ok,no)=>{req.onsuccess=()=>ok(req.result);req.onerror=()=>no(req.error);});
+        let settings;
+        try{
+            if(!db.objectStoreNames.contains('store'))return;
+            const q=db.transaction('store').objectStore('store').get('rp_hub_settings');
+            settings=await new Promise((ok,no)=>{q.onsuccess=()=>ok(q.result);q.onerror=()=>no(q.error);});
+        }finally{db.close();}
+        if(!settings?.apiKey || !settings.apiUrl)return;
+        const url=RPHubApiUtils.buildApiEndpoint(settings.apiUrl,'chat/completions');
+        await c.call('/jobs/provider',{method:'POST',json:{url,apiKey:settings.apiKey}});
+        disk.setItem(saved,'1');
+    }
+    async function heads(c){
+        const rows=await c.call('/sync');c.check();remoteHeads=rows;return rows;
+    }
+    async function push(c,first,staged,finalize) {
+        const slot=localKey(c,scope.id), b=base(c.s);
+        let work=await store('outbox',s=>s.get(slot));
+        if(!work){
+            if(b && b.stamp===revision() && !staged)return b;
+            const data=staged||await capture();
+            if(b && data.manifest.root===b.root){
+                b.stamp=data.stamp;setBase(c.s,scope.id,b);return b;
+            }
+            if(!data.meaningful && !b)return null;
+            if(first && !b && remoteHeads.length && !disk.getItem(prefix(c.s)+'allow/'+scope.id))
+                throw Error('两端均有进度。请先在私人站点选择上传本机另存分支，或拉取云档另开进度。');
+            const manifest={...data.manifest,parent:b?.id||null,branch:b?.branch||'main'};
+            work={manifest,stamp:data.stamp};
+            c.check();
+            const db=await cache();
+            await new Promise((ok,no)=>{
+                const tx=db.transaction(['parts','outbox'],'readwrite');
+                const parts=tx.objectStore('parts');
+                for(const [id,value] of data.pieces){
+                    const key=partKey(c,id), found=parts.getKey(key);
+                    found.onsuccess=()=>{if(found.result===undefined)parts.put(value,key);};
+                }
+                tx.objectStore('outbox').put(work,slot);
+                tx.oncomplete=ok;tx.onabort=()=>no(tx.error);
+            });
+        }
+        const m=work.manifest;
+        if((m.turns?.length && c.s.gameVersion!==1)||(m.imageVersion && c.s.imageVersion!==1)){
+            const info=await c.call('/site');
+            if(info.site!==c.s.site || (m.turns?.length && info.gameVersion!==1) || (m.imageVersion && info.imageVersion!==1))throw Error('请升级私人站点以同步游戏存档与图库，本机进度已保留');
+            const capabilities={gameVersion:info.gameVersion||0,imageVersion:info.imageVersion||0};
+            c.check();Object.assign(c.s,capabilities);api.save({...api.session(),...capabilities});
+        }
+        for(let i=0;i<m.parts.length;i+=128){
+            const missing=await c.call('/missing',{method:'POST',json:{hashes:m.parts.slice(i,i+128)}});
+            for(const id of missing){
+                const bytes=await store('parts',s=>s.get(partKey(c,id)));
+                if(!bytes)throw Error('待传内容缺失，请检查本机文件副本');
+                await c.call('/chunks/'+id,{method:'PUT',body:bytes});
+            }
+        }
+        const result=finalize?await finalize(m):await c.call('/sync',{method:'POST',json:m});
+        c.check();
+        const next={...result,root:m.root,stamp:work.stamp,receipt:gameStatus(m.turns)};
+        setBase(c.s,scope.id,next);
+        await store('outbox',s=>s.delete(slot),true);
+        return next;
+    }
+    async function pull(c,head,automatic=false,official=false) {
+        if(!head)return false;
+        const b=base(c.s);
+        if(head.id===b?.id && !official)return false;
+        const stamp=revision(), m=await c.call('/sync/'+head.id);
+        if(await archive.codec.hash(JSON.stringify(m))!==head.id)throw Error('云端修订校验失败，已保留本机进度');
+        const pkg=await RPSyncFormat.unpack(m,async id=>{
+            const key=partKey(c,id), known=await store('parts',s=>s.get(key));
+            if(known)return known;
+            const bytes=new Uint8Array(await(await c.call('/chunks/'+id,{raw:true})).arrayBuffer());
+            if(await RPSyncFormat.digest(bytes)!==id)throw Error('下载内容不完整，已保留本机进度');
+            await store('parts',s=>s.put(bytes,key),true);return bytes;
+        });
+        c.check();
+        // Imports are staged outside the live namespace. Even a partial multi-database restore cannot overwrite it.
+        const old=(await archive.runs()).find(r=>r.id===scope.id);
+        const rotate=automatic && b?.branch===head.branch && b.stamp===stamp && old?.syncCopy?.key===c.key;
+        if(rotate)pkg.body.runs[0].sources=[...new Set([...old.sources,scope.id])];
+        await RPFirstConnection.retainDeviceSettings(pkg);
+        pkg.digest=await archive.codec.hash(JSON.stringify(official?[c.key,head.id,pkg.body,'settlement',scope.id,stamp]:[c.key,head.id,pkg.body]));
+        const id=await archive.importPackage(pkg,automatic?{key:c.key}:undefined);
+        const existing=base(c.s,id);
+        if(existing && existing.stamp!==revision(id))throw Error('这份云档已在本机继续游玩，可从本机进度打开');
+        if(stamp!==revision()||window.RPGameBusy?.())throw Error('本机正在游玩，云档已下载，空闲后可继续');
+        c.check();
+        setBase(c.s,id,{id:head.id,branch:head.branch,root:m.root,stamp:revision(id),receipt:gameStatus(m.turns)});
+        await archive.activate(id);
+        if(rotate)disk.setItem('__rph_sync_retire/'+id,JSON.stringify({old:scope.id,next:id,stamp,key:c.key}));
+        status('云端已确认，正在打开进度');
+        location.replace('index.html');return true;
+    }
+    async function run(action,branch) {
+        const automatic=action==='auto', c=context(automatic);
+        return navigator.locks.request('rph-sync/'+c.key,async()=>{
+            c.check();
+            if(scope.id!==(sessionStorage.getItem(scope.activeKey)||'main'))return;
+            activity++;
+            try{
+                if(automatic)await provisionModel(c).catch(e=>console.warn('后台模型配置尚未确认',e.message));
+                if(action==='list'){await heads(c);return;}
+                if(action==='push'){
+                    const sent=await push(c,false);
+                    if(sent && sent.stamp!==revision())await push(c,false);
+                    await heads(c);
+                }
+                else {
+                    const list=await heads(c), b=base(c.s);
+                    const head=list.find(h=>h.branch===(branch||b?.branch))||list[0];
+                    if(action==='pull'){if(await pull(c,head))return;}
+                    else {
+                        if(window.RPGenerationActive?.() || (window.RPGameBusy?.() && head && head.id!==b?.id)){status('本机正在游玩，稍后接续');schedule(2500);return;}
+                        const queued=await store('outbox',s=>s.get(localKey(c,scope.id)));
+                        if(queued || !b || b.stamp!==revision()){
+                            const data=queued?null:await capture();
+                            if(!b && head && data && !data.meaningful){if(await pull(c,head,true))return;}
+                            const saved=await push(c,true,data);
+                            // A local change kept its own branch if another writer advanced the same parent.
+                            if(saved && saved.id!==b?.id){await heads(c);
+                                if(b && saved.branch!==b.branch){
+                                    const advanced=remoteHeads.find(h=>h.branch===b.branch);
+                                    if(advanced && !window.RPGameBusy?.() && await pull(c,advanced))return;
+                                }
+                                if(saved.stamp===revision())status(saved.receipt||'云端已确认');else{status('本机已保存 · 待同步');schedule(200);}
+                                retry=1500;return;}
+                        }
+                        if(head && await pull(c,head,true))return;
+                    }
+                }
+                retry=1500;
+                const current=base(c.s);
+                status(current?.stamp===revision()?(current.receipt||'云端已确认'):action==='pull'&&!remoteHeads.length?'此账号还没有同步进度':'本机已保存');
+            }catch(e){
+                if(!automatic || !e.official)throw e;
+                // Preserve the local attempt in its namespace and resume the authoritative result.
+                if(await pull(c,e.official,false,true))return;
+                throw e;
+            }finally{activity--;window.dispatchEvent(new Event('rph-sync-status'));}
+        });
+    }
+    async function submitJob(input,signal) {
+        const c=context(true);
+        return navigator.locks.request('rph-sync/'+c.key,async()=>{
+            c.check();signal?.throwIfAborted();
+            if(!base(c.s))await heads(c);
+            if(await store('outbox',s=>s.get(localKey(c,scope.id))))await push(c,true);
+            let job;
+            const post=async ref=>{
+                c.check();signal?.throwIfAborted();
+                job=await c.call('/jobs',{method:'POST',json:{...input,...ref},signal});
+                return job.commit;
+            };
+            const data=await capture();
+            const saved=await push(c,true,data,manifest=>post({manifest}));
+            if(!job){if(!saved)throw Error('请先保存当前对话');await post({revision:saved.id});}
+            status('生成任务已由私人站点接收');return job.id;
+        });
+    }
+    function schedule(ms=1500) {
+        clearTimeout(timer);
+        if(mode()!=='auto' || document.hidden)return;
+        timer=setTimeout(()=>run('auto').catch(e=>{
+            status('本机已保存 · 待同步：'+e.message);
+            if(mode()==='auto' && (!e.status||e.status>=500) && navigator.onLine){
+                retry=Math.min(60000,Math.max(retry*2,3000));schedule(retry);
+            }
+        }),ms);
+    }
+    function restoreMode(previous){
+        const c=context(false);
+        if(previous==='auto' && disk.getItem(prefix(c.s)+'mode')===null){
+            disk.setItem(prefix(c.s)+'allow/'+scope.id,'1');disk.setItem(prefix(c.s)+'mode','auto');
+        }
+    }
+    function changeMode(value) {
+        const c=context(false);
+        disk.setItem(prefix(c.s)+'mode',value==='auto'?'auto':'manual');
+        clearTimeout(timer);status(value==='auto'?'已启用自动接续':'手动同步 · 本机已保存');
+        if(value==='auto')schedule(0);
+    }
+    function changed(){status(mode()==='auto'?'本机已保存 · 待同步':'本机已保存');schedule();}
+    window.addEventListener('rph-local-change',changed);
+    window.addEventListener('storage',e=>{if(e.key==='__rph_revision_'+scope.id)changed();});
+    for(const event of ['online','pageshow','focus'])window.addEventListener(event,()=>schedule(0));
+    document.addEventListener('resume',()=>schedule(0));
+    document.addEventListener('visibilitychange',()=>schedule(0));
+    window.RPPrivateSync={run,mode,restoreMode,changeMode,schedule,submitJob,get branch(){const s=api.session();return accountKey(s)?base(s)?.branch:null;},get status(){return message;},get heads(){return remoteHeads;},
+        reset(){clearTimeout(timer);remoteHeads=[];status('本机已保存');},get busy(){return !!activity;},allowFirst(){const c=context(false);disk.setItem(prefix(c.s)+'allow/'+scope.id,'1');}};
+    const retireKey='__rph_sync_retire/'+scope.id,retire=disk.getItem(retireKey);
+    if(retire)archive.retireSyncCopy(JSON.parse(retire)).then(ok=>{if(ok)disk.removeItem(retireKey);}).catch(()=>{});
+    if(!location.pathname.endsWith('private.html'))schedule(1200);
+})();
