@@ -52,7 +52,7 @@ export async function updateRoute({env,req,path,role,readJson,ctx}) {
     if(selected?.revision!==latest.revision||!newer(latest.version,installed.version))
         fail(409,'发行版本已变化，请重新检查');
     const before=view(await row());
-    if(['queued','building','deployed'].includes(before.state))return Response.json(before,202);
+    if(['queued','building','deployed'].includes(before.state))return Response.json(before,{status:202});
     if(!before.ready)fail(409,'请先为本站配置 Cloudflare Deploy Hook');
     const id=crypto.randomUUID();
     const result=await db.prepare(`UPDATE site_updates SET version=?,revision=?,request_id=?,state='queued',changed=unixepoch()
@@ -66,5 +66,5 @@ export async function updateRoute({env,req,path,role,readJson,ctx}) {
             await db.prepare("UPDATE site_updates SET state='failed' WHERE request_id=? AND state='queued'").bind(id).run();
         }
     })());
-    return Response.json(view(await row()),202);
+    return Response.json(view(await row()),{status:202});
 }
