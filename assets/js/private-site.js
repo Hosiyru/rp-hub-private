@@ -41,7 +41,7 @@
                 await api(action==='check'?'/updates/latest':'/updates');
             if(session!==releaseSession)return;
             $('releaseCurrent').textContent='本站当前版本 '+r.installed.version;
-            if(r.latest)releaseTarget=r.latest;
+            if(r.latest)releaseTarget=r.available?r.latest:null;
             const pending=['queued','building','deployed'].includes(r.state);
             const available=releaseTarget && releaseTarget.version!==r.installed.version && (r.available??true);
             show('releaseInstall',!!available && r.ready && !pending);

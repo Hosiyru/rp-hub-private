@@ -15,18 +15,19 @@ export function newer(candidate,current) {
 
 async function published() {
     const read=async url=>{
-        const res=await fetch(url,{headers:{'User-Agent':'rp-hub-release-check'},redirect:'error',
-            signal:AbortSignal.timeout(10000),cf:{cacheTtl:60,cacheEverything:true}});
-        if(!res.ok)throw Error();
-        return res.json();
+        const res=await fetch(url,{headers:{'User-Agent':'RP-Hub'},redirect:'manual'});
+        if(!res.ok)throw Error(new URL(url).hostname+' HTTP '+res.status);
+        return res;
     };
     try{
-        const {sha}=await read('https://api.github.com/repos/'+source+'/commits/main');
-        if(!/^[a-f0-9]{40}$/.test(sha))throw Error();
-        const manifest=await read('https://raw.githubusercontent.com/'+source+'/'+sha+'/package.json');
-        if(manifest.name!=='rp-hub-private-site'||!semver.test(manifest.version))throw Error();
+        // Git's public ref advertisement also works when anonymous GitHub API quotas are exhausted.
+        const refs=await (await read('https://github.com/'+source+'.git/info/refs?service=git-upload-pack')).text();
+        const sha=refs.match(/([a-f0-9]{40}) refs\/heads\/main(?:\x00|\n)/)?.[1];
+        if(!sha)throw Error('找不到发行分支');
+        const manifest=await (await read('https://raw.githubusercontent.com/'+source+'/'+sha+'/package.json')).json();
+        if(manifest.name!=='rp-hub-private-site'||!semver.test(manifest.version))throw Error('发行清单无效');
         return {version:manifest.version,revision:sha};
-    }catch{fail(502,'暂时无法读取公开发行版本，请稍后重查');}
+    }catch(err){fail(502,'暂时无法读取公开发行版本（'+err.message+'），请稍后重查');}
 }
 
 export async function updateRoute({env,req,path,role,readJson}) {
@@ -59,7 +60,7 @@ export async function updateRoute({env,req,path,role,readJson}) {
         .bind(latest.version,latest.revision,id,installed.revision).run();
     if(result.meta.changes && hook){
         try{
-            const reply=await fetch(hook,{method:'POST',redirect:'error',signal:AbortSignal.timeout(15000)});
+            const reply=await fetch(hook,{method:'POST',redirect:'manual'});
             if(!reply.ok)throw Error();
         }catch{
             await db.prepare("UPDATE site_updates SET state='failed' WHERE request_id=? AND state='queued'").bind(id).run();
