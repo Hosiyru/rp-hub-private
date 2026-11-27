@@ -2,6 +2,8 @@
 
 在你自己的 Cloudflare 账号中部署 RP-Hub。电脑打开私人站点即可登录，Android 本地版可以扫码或填写同一站点地址。首次连接会列出本机与云档，迁入会保留双方的独立进度。
 
+0.7.1 修复了启动时切卡可能清空旧聊天的问题。如果看到「正在读取上次的聊天」，请等聊天显示后再点一次角色卡。升级后可关闭本站旧标签页，再重新打开以启用新版离线界面。
+
 [![部署到我的 Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https%3A%2F%2Fgithub.com%2FHosiyru%2Frp-hub-private)
 
 1. 打开 APK 的「设置 → 私人站点与登录 → 部署到我的 CF」，生成并妥善保存站主认领口令。如果从本仓库按钮开始，可在密码管理器中生成 43 位随机字母数字串作为口令。

@@ -1,5 +1,5 @@
 /* The APK ships these assets in its package. A hosted copy retains the same shell after the first online visit. */
-const cacheName='rph-local-shell-0.7.0-recovery';
+const cacheName='rph-local-shell-0.7.1';
 const shell=[
     'index.html','local.html','private.html','deploy.html','character/index.html','novel/index.html',
     ...['theme','styles','local','private'].map(n=>'assets/css/'+n+'.css'),

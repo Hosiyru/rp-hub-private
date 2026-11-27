@@ -1151,6 +1151,7 @@ const app = createApp({
         const memoryBackfillProgress = ref({ status: 'idle', message: '', phase: '', stages: [] });
         const retryingClassicMemoryId = ref('');
         let _isApplyingCharacterScopedData = false;
+        let restoringStartupStory = false;
         let _classicMemoriesLoaded = false;
         let _characterSwitchEpoch = 0;
         let _characterSwitchSavePromise = Promise.resolve();
@@ -7111,6 +7112,10 @@ const app = createApp({
         };
 
         const selectCharacter = async (index, isNewImport = false, { silent = false } = {}) => {
+            if (!_initComplete || restoringStartupStory) {
+                if (!silent) showToast('正在读取上次的聊天，请稍后再切换角色', 'info');
+                return false;
+            }
             const char = characters.value[index];
             if (!char) {
                 showToast('角色不存在，无法读取聊天记录', 'error');
@@ -7837,51 +7842,56 @@ const app = createApp({
 
             // Restore Last Active Session
             if (lastActiveCharacterId.value !== null && characters.value[lastActiveCharacterId.value]) {
-                // Restore character selection without clearing chat history (we load it from DB)
-                _isApplyingCharacterScopedData = true;
-                currentCharacterIndex.value = lastActiveCharacterId.value;
-                resetChatRenderWindow();
-                const char = characters.value[currentCharacterIndex.value];
-
-                // Load Chat History for this character
+                restoringStartupStory = true;
                 try {
-                    if (!char.uuid) {
-                        char.uuid = generateUUID();
-                        await saveCharactersNow();
+                    // Restore character selection without clearing chat history (we load it from DB)
+                    _isApplyingCharacterScopedData = true;
+                    currentCharacterIndex.value = lastActiveCharacterId.value;
+                    resetChatRenderWindow();
+                    const char = characters.value[currentCharacterIndex.value];
+
+                    // Load Chat History for this character
+                    try {
+                        if (!char.uuid) {
+                            char.uuid = generateUUID();
+                            await saveCharactersNow();
+                        }
+                        await loadStoryBranchesForCharacter(char);
+                        chatHistory.value = await loadStoredChatHistory(
+                            char,
+                            currentCharacterIndex.value,
+                            getStoryBranchScopeId(char.uuid)
+                        );
+                    } catch (error) {
+                        console.error('Error loading chat history on restore:', error);
+                        currentCharacterIndex.value = -1;
+                        _isApplyingCharacterScopedData = false;
+                        showToast('聊天记录恢复失败，原记录未被覆盖，请重新选择角色重试', 'error', 5000);
+                        return;
                     }
-                    await loadStoryBranchesForCharacter(char);
-                    chatHistory.value = await loadStoredChatHistory(
-                        char,
-                        currentCharacterIndex.value,
-                        getStoryBranchScopeId(char.uuid)
-                    );
-                } catch (error) {
-                    console.error('Error loading chat history on restore:', error);
-                    currentCharacterIndex.value = -1;
-                    _isApplyingCharacterScopedData = false;
-                    showToast('聊天记录恢复失败，原记录未被覆盖，请重新选择角色重试', 'error', 5000);
-                    return;
+                    loadGlobalUiTemplateRuntimeForCharacter(char);
+
+                    // Load Char Specifics
+                    applyCharacterScopedResources(char);
+                    finishApplyingCharacterScopedData();
+
+                    if (char.recentGenerationTimes) recentGenerationTimes.value = JSON.parse(JSON.stringify(char.recentGenerationTimes));
+                    else recentGenerationTimes.value = [];
+
+                    await loadCharacterMemories(getStoryBranchScopeId(char.uuid), ' on restore');
+
+                    // Enforce special rules (Nai画图正则 & 自动生图)
+                    enforceSpecialRules();
+
+                    // Sync image style rules
+                    if (isAutoImageGenEnabled.value) {
+                        updateImageGenRegexState({ enableRegex: true });
+                    }
+
+                    await scrollChatToBottom();
+                } finally {
+                    restoringStartupStory = false;
                 }
-                loadGlobalUiTemplateRuntimeForCharacter(char);
-
-                // Load Char Specifics
-                applyCharacterScopedResources(char);
-                finishApplyingCharacterScopedData();
-
-                if (char.recentGenerationTimes) recentGenerationTimes.value = JSON.parse(JSON.stringify(char.recentGenerationTimes));
-                else recentGenerationTimes.value = [];
-
-                await loadCharacterMemories(getStoryBranchScopeId(char.uuid), ' on restore');
-
-                // Enforce special rules (Nai画图正则 & 自动生图)
-                enforceSpecialRules();
-
-                // Sync image style rules
-                if (isAutoImageGenEnabled.value) {
-                    updateImageGenRegexState({ enableRegex: true });
-                }
-
-                await scrollChatToBottom();
             } else if (characters.value.length > 0) {
                 // Fallback to first character if no last active
                 selectCharacter(0);
