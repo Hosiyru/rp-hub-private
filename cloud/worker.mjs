@@ -40,7 +40,7 @@ function accountInput(body) {
     if(!name || name.length>48 || /[\u0000-\u001f]/.test(name) || !KEY.test(body.key||'')) problem(400,'请输入账号名和完整的登录密钥');
     return name;
 }
-async function handle(req,env) {
+async function handle(req,env,ctx) {
     const url=new URL(req.url), origin=req.headers.get('Origin');
     const mobile=origin===APK;
     if(origin && origin!==url.origin && !mobile) problem(403,'来源站点不匹配');
@@ -100,7 +100,7 @@ async function handle(req,env) {
     const expectedAccount=req.headers.get('X-RP-Account');
     if(expectedAccount && expectedAccount!==a.id)problem(409,'当前登录账号已变化，请返回私人站点核对');
     if(path==='/me' && method==='GET')return json(a);
-    if(path==='/updates'||path==='/updates/latest')return updateRoute({env,req,path,role:a.role,readJson});
+    if(path==='/updates'||path==='/updates/latest')return updateRoute({env,req,path,role:a.role,readJson,ctx});
     if(path==='/jobs'||path.startsWith('/jobs/'))return generationRoute({env,account:a.id,req,path,method,readJson,sha});
     if(path==='/sync'||path.startsWith('/sync/'))return syncRoute({db,account:a.id,path,method,req,readJson,sha});
     if(path==='/logout' && method==='POST'){
@@ -179,12 +179,12 @@ async function handle(req,env) {
     problem(404,'接口不存在');
 }
 export default {
-    async fetch(req,env){
+    async fetch(req,env,ctx){
         const url=new URL(req.url);
         if(url.pathname==='/')return Response.redirect(new URL('/private.html',url),302);
         if(!url.pathname.startsWith(PREFIX+'/'))return env.ASSETS.fetch(req);
         let response;
-        try{response=await handle(req,env);}
+        try{response=await handle(req,env,ctx);}
         catch(e){response=json({error:e.status?e.message:'站点服务暂不可用，请检查绑定和数据库迁移',official:e.official},e.status||503);}
         const h=response.headers;h.set('Cache-Control','no-store');h.set('Vary','Origin');h.set('X-Content-Type-Options','nosniff');
         if(req.headers.get('Origin')===APK){

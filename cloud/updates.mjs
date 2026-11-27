@@ -30,7 +30,7 @@ async function published() {
     }catch(err){fail(502,'暂时无法读取公开发行版本（'+err.message+'），请稍后重查');}
 }
 
-export async function updateRoute({env,req,path,role,readJson}) {
+export async function updateRoute({env,req,path,role,readJson,ctx}) {
     if(role!=='owner')fail(403,'仅站主可以管理版本');
     const db=env.DB;
     const row=()=>db.prepare('SELECT * FROM site_updates WHERE singleton=1').first();
@@ -58,13 +58,13 @@ export async function updateRoute({env,req,path,role,readJson}) {
     const result=await db.prepare(`UPDATE site_updates SET version=?,revision=?,request_id=?,state='queued',changed=unixepoch()
         WHERE singleton=1 AND (state NOT IN ('queued','building') OR changed<unixepoch()-1800 OR revision=?)`)
         .bind(latest.version,latest.revision,id,installed.revision).run();
-    if(result.meta.changes && hook){
+    if(result.meta.changes && hook)ctx.waitUntil((async()=>{
         try{
             const reply=await fetch(hook,{method:'POST',redirect:'manual'});
             if(!reply.ok)throw Error();
         }catch{
             await db.prepare("UPDATE site_updates SET state='failed' WHERE request_id=? AND state='queued'").bind(id).run();
         }
-    }
+    })());
     return Response.json(view(await row()),202);
 }

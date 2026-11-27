@@ -33,9 +33,10 @@
         releaseSession++;clearTimeout(releaseTimer);releaseTarget=null;
         show('siteRelease',false);show('releaseInstall',false);$('releaseState').textContent='';
     }
-    async function releaseAction(action){
+    async function releaseAction(action,remainingRetries=3){
         const session=releaseSession,apply=$('releaseInstall'),check=$('releaseCheck');
         clearTimeout(releaseTimer);check.disabled=true;apply.disabled=true;
+        if(action==='install')$('releaseState').textContent='正在向本站提交更新…';
         try{
             const r=action==='install'?await api('/updates',{method:'POST',json:{revision:releaseTarget.revision}}):
                 await api(action==='check'?'/updates/latest':'/updates');
@@ -56,7 +57,13 @@
             if(available && !r.ready)message+=' 启用按钮前，请在本站 Worker 配置 RP_UPDATE_HOOK（见部署模板说明）。';
             $('releaseState').textContent=message;
         }catch(err){
-            if(session===releaseSession){$('releaseState').textContent=err.message+'。可重新检查。';show('releaseInstall',false);}
+            if(session===releaseSession){
+                show('releaseInstall',false);
+                if(action!=='check' && remainingRetries>0 && (!err.status||err.status>=500)){
+                    $('releaseState').textContent='等待重新连接原站点，正在核对更新结果…';
+                    releaseTimer=setTimeout(()=>releaseAction('status',remainingRetries-1),5000);
+                }else $('releaseState').textContent=err.message+'。可重新检查。';
+            }
         }finally{if(session===releaseSession){check.disabled=false;apply.disabled=false;}}
     }
     $('releaseCheck').onclick=()=>releaseAction('check');
