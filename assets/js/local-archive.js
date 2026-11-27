@@ -60,7 +60,7 @@
         blocks[id] = str;
         return id;
     }
-    async function snapshot(run, blocks) {
+    async function snapshot(run, blocks, select) {
         const revisionKey = '__rph_revision_' + run;
         const revision = scope.disk.getItem(revisionKey);
         const dbs = [], storage = [];
@@ -69,6 +69,8 @@
         const registeredKeys = new Set(JSON.parse(scope.disk.getItem('__rph_registered_keys_'+run)||'[]'));
         for (const {name, version} of await scope.factory.databases()) {
             if (!visible(run,name) || (run === root && !registered.has(name))) continue;
+            const dbName=logical(run,name);
+            if(select && !select.database(dbName))continue;
             const db = await open(name);
             try {
                 if (logical(run,name) === 'RPHubDB' && db.objectStoreNames.contains('store')) await library.reconcile(db);
@@ -81,7 +83,7 @@
                         const spec = {name:n, keyPath:store.keyPath, autoIncrement:store.autoIncrement,
                             indexes:[...store.indexNames].map(i => {const x=store.index(i); return [i,x.keyPath,x.unique,x.multiEntry];}), rows:[]};
                         stores.push(spec);
-                        const [keys,values] = await Promise.all([request(store.getAllKeys()),request(store.getAll())]);
+                        const [keys,values] = select ? await select.rows(dbName,store,request) : await Promise.all([request(store.getAllKeys()),request(store.getAll())]);
                         for (let i=0;i<keys.length;i++) {
                             if (logical(run,name)==='RPHubDB' && n==='store' && keys[i]===library.mirror) continue;
                             spec.rows.push([await encode(keys[i]),await remember(blocks,values[i])]);
@@ -92,6 +94,7 @@
             } finally { db.close(); }
         }
         for (const key of Object.keys(scope.disk).filter(k=>visible(run,k)).sort()) {
+            if(select && !select.storage(logical(run,key)))continue;
             if (run!==root || registeredKeys.has(key) || /^(rp_hub_|rphub[-_]|roleplay_hub_|ai_chargen_|fate[-_])/.test(key))
                 storage.push([logical(run,key),scope.disk.getItem(key)]);
         }
@@ -100,15 +103,17 @@
     }
     function refs(state) { return state.dbs.flatMap(d=>d.stores.flatMap(s=>s.rows.map(row=>row[1]))); }
     const runs = async () => [{id:root,name:'原始进度'},...await all('runs')];
+    async function stableSnapshot(select){
+        for(let attempt=0;;attempt++){
+            const blocks={};
+            try{return {blocks,state:await snapshot(scope.id,blocks,select)};}
+            catch(e){if(e.code!=='SAVE_CHANGED'||attempt>=3)throw e;await new Promise(ok=>setTimeout(ok,250*(attempt+1)));}
+        }
+    }
     async function checkpoint(name) {
         name = String(name).trim();
         if (!name || name.length>80) throw Error('请输入 1 至 80 字的存档名');
-        let blocks,state;
-        for(let attempt=0;;attempt++){
-            blocks={};
-            try{state=await snapshot(scope.id,blocks);break;}
-            catch(e){if(e.code!=='SAVE_CHANGED'||attempt>=3)throw e;await new Promise(ok=>setTimeout(ok,250*(attempt+1)));}
-        }
+        const {blocks,state}=await stableSnapshot();
         const point = {id:uid(),run:scope.id,name,time:Date.now(),state};
         const tx = (await meta).transaction(['points','blocks'],'readwrite');
         Object.entries(blocks).forEach(([k,v])=>tx.objectStore('blocks').put(v,k));
@@ -117,14 +122,86 @@
         scope.changed();
         return point;
     }
+    const retention=30*86400000;
+    async function retainedPoints(){
+        const db=await meta,points=await all('points'),cutoff=Date.now()-retention;
+        if(!points.some(p=>p.recycle && p.time<=cutoff))return points;
+        // A concurrent checkpoint can pin the same block. Read the final reference set inside the write transaction.
+        const tx=db.transaction(['points','blocks'],'readwrite'),finished=done(tx),table=tx.objectStore('points');
+        const latest=await request(table.getAll()),keep=latest.filter(p=>!p.recycle||p.time>cutoff);
+        const used=new Set(keep.flatMap(p=>refs(p.state)));
+        for(const p of latest)if(p.recycle && p.time<=cutoff){
+            table.delete(p.id);for(const k of refs(p.state))if(!used.has(k))tx.objectStore('blocks').delete(k);
+        }
+        await finished;return keep;
+    }
+    async function beforeDelete(ids){
+        if(!ids.length || ids.some(id=>typeof id!=='string'||!id))throw Error('角色缺少实例标识，无法创建删除副本');
+        const {blocks,state}=await stableSnapshot(RPCardRecovery.selection(ids));
+        const stamp=scope.disk.getItem('__rph_revision_'+scope.id);
+        const pending=[];
+        for(const id of ids){
+            const part=await RPCardRecovery.extract(state,blocks,id);
+            const name=RPCardRecovery.library(part,blocks)[0].name||'未命名角色';
+            pending.push({id:uid(),run:scope.id,name,time:Date.now(),recycle:id,state:part});
+        }
+        if(stamp!==scope.disk.getItem('__rph_revision_'+scope.id))throw Error('备份期间有新进度，请重试删除');
+        const tx=(await meta).transaction(['points','blocks'],'readwrite'),finished=done(tx);
+        try{
+            const pinned=new Set();
+            for(const p of pending){tx.objectStore('points').add(p,p.id);for(const k of refs(p.state))pinned.add(k);}
+            for(const k of pinned)tx.objectStore('blocks').put(blocks[k],k);
+        }catch(e){tx.abort();await finished.catch(()=>{});throw e;}
+        await finished;
+        const cards=RPCardRecovery.library(state,blocks);
+        return {stamp,indices:ids.map(id=>cards.findIndex(c=>c.uuid===id))};
+    }
+    async function pointSource(id){
+        const p=await get('points',id);
+        if(!p||p.run!==scope.id||(p.recycle && p.time<=Date.now()-retention))throw Error('恢复点已失效');
+        return {state:p.state,blocks:{},readBlock:k=>get('blocks',k)};
+    }
+    async function recoverCard(source,cardId){
+        return navigator.locks.request('rph-recover/'+scope.id,async()=>{
+            if(sessionStorage.getItem(scope.activeKey)!==scope.id)throw Error('当前进度已切换，请重新打开存档页');
+            const part=await RPCardRecovery.readCard(source,cardId);
+            const stamp=scope.disk.getItem('__rph_revision_'+scope.id);
+            const blocks={},state=await snapshot(scope.id,blocks);
+            for(const k of refs(part))blocks[k]=source.blocks[k];
+            await RPCardRecovery.merge(state,blocks,part,cardId);
+            const run={id:uid(),name:'找回「'+(RPCardRecovery.library(part,blocks)[0].name||cardId)+'」后的进度',sources:[scope.id]};
+            try{
+                await materialize(run.id,state,k=>blocks[k]);
+                const db=await meta,tx=db.transaction(['points','runs'],'readwrite'),finished=done(tx);
+                const points=tx.objectStore('points'),existing=await request(points.getAll());
+                if(stamp!==scope.disk.getItem('__rph_revision_'+scope.id)||sessionStorage.getItem(scope.activeKey)!==scope.id){
+                    tx.abort();await finished.catch(()=>{});throw Error('恢复期间当前进度有新写入，请重试');
+                }
+                const original=await request(tx.objectStore('runs').get(scope.id));
+                run.sources=[...new Set([...run.sources,...(original?.sources||[])])];
+                tx.objectStore('runs').add(run,run.id);
+                for(const p of existing)if(p.run===scope.id && (!p.recycle||p.time>Date.now()-retention)){
+                    const copy={...p,id:uid(),run:run.id};points.add(copy,copy.id);
+                }
+                await finished;
+            }catch(err){await discard(run.id);throw err;}
+            return {id:run.id,stamp};
+        });
+    }
+    function activateRecovered({id,stamp}){
+        if(scope.disk.getItem('__rph_revision_'+scope.id)!==stamp||sessionStorage.getItem(scope.activeKey)!==scope.id)
+            throw Error('当前进度有新写入，已保留原进度，请重新恢复');
+        if(location.origin==='https://rphub.local')scope.disk.setItem('__rph_mirror_after_restore',id);
+        sessionStorage.setItem(scope.activeKey,id);scope.disk.setItem(scope.activeKey,id);
+    }
     async function portable(onlyRun) {
         const blocks = {}, entries = [];
-        const points = (await all('points')).filter(p=>!onlyRun || p.run===onlyRun);
+        const points = (await retainedPoints()).filter(p=>!onlyRun || p.run===onlyRun);
         for (const run of await runs()) {
             if (onlyRun && onlyRun!==run.id) continue;
             const state = await snapshot(run.id,blocks);
             const {syncCopy,...identity}=run;
-            entries.push({...identity,state,points:points.filter(p=>p.run===run.id).map(({name,time,state})=>({name,time,state}))});
+            entries.push({...identity,state,points:points.filter(p=>p.run===run.id).map(({name,time,state,recycle})=>({name,time,state,...(recycle?{recycle}:{})}))});
         }
         for (const p of points) for (const id of refs(p.state)) if (!Object.hasOwn(blocks,id)) {
             blocks[id] = await get('blocks',id);
@@ -208,7 +285,7 @@
     }
     async function fork(pointId) {
         const point=await get('points',pointId);
-        if (!point) throw Error('存档点不存在');
+        if (!point || point.recycle) throw Error('请选择可打开的命名存档点');
         const run={id:uid(),name:point.name+' · 分支'};
         try {
             await materialize(run.id,point.state,k=>get('blocks',k));
@@ -273,9 +350,9 @@
         for (const run of pkg.body.runs) {
             const rows = run.state.dbs.find(d=>d.name==='RPHubDB')?.stores.find(s=>s.name==='store')?.rows || [];
             const value = key => {const row=rows.find(r=>r[0]===key);return row ? decode(JSON.parse(pkg.body.blocks[row[1]])) : [];};
-            result[run.id] = {sources:run.sources||[],cards:value(library.key).map(c=>c.uuid).filter(Boolean),deleted:value('__rph_deleted_cards')};
+            result[run.id] = {sources:run.sources||[],cards:value(library.key).map(c=>c.uuid).filter(Boolean),deleted:value('__rph_deleted_cards'),restored:value('__rph_restored_cards')};
         }
         return result;
     }
-    window.RPLocalArchive={inventory,checkpoint,portable,readPackage,importPackage,retireSyncCopy,fork,activate,runs,points:()=>all('points'),codec:{decode,encode,hash}};
+    window.RPLocalArchive={inventory,checkpoint,portable,readPackage,importPackage,retireSyncCopy,fork,activate,runs,points:retainedPoints,remember,beforeDelete,pointSource,recoverCard,activateRecovered,codec:{decode,encode,hash}};
 })();

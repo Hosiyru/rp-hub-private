@@ -25,13 +25,14 @@ function sql(statement) {
 }
 const info=()=>sql('SELECT site.id AS site,u.* FROM site JOIN site_updates u ON u.singleton=site.singleton WHERE site.singleton=1').results[0];
 const deploy=cfg=>cf(['deploy','--keep-vars'],cfg);
-if(!wrapper && !sql("SELECT name FROM sqlite_master WHERE name='site_updates'").results.length)
-    cf(['d1','migrations','apply','DB','--remote']);
+const bootstrap=!wrapper && !sql("SELECT name FROM sqlite_master WHERE name='site_updates'").results.length;
+if(bootstrap)cf(['d1','migrations','apply','DB','--remote']);
 const job=info();
 if(!job?.site)throw Error('缺少原站点身份');
 if(!job.revision){
     if(!wrapper){
         run(process.execPath,['cloud/build.mjs']);
+        if(!bootstrap)cf(['d1','migrations','apply','DB','--remote']);
         deploy(config);
     }
 }else if(job.state==='queued'){

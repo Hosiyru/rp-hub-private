@@ -8,6 +8,22 @@ export async function syncRoute({db,account,path,method,req,readJson,sha}) {
             WHERE h.account=? ORDER BY r.created DESC,r.rowid DESC`).bind(account).all();
         return Response.json(results);
     }
+    if(path==='/sync/backups' && method==='GET'){
+        const {results}=await db.prepare(`WITH periods AS (
+            SELECT branch,created/86400 AS period,MAX(rowid) AS seq,'day' AS kind FROM sync_revisions WHERE account=? GROUP BY branch,period
+            UNION ALL
+            SELECT branch,(created+259200)/604800 AS period,MAX(rowid) AS seq,'week' AS kind FROM sync_revisions WHERE account=? GROUP BY branch,period
+        ), ranked AS (
+            SELECT *,ROW_NUMBER() OVER(PARTITION BY branch,kind ORDER BY period DESC) AS position FROM periods
+        )
+        SELECT r.id,r.branch,r.created,group_concat(k.kind) AS periods,json_extract(r.manifest,'$.label') AS label
+        FROM ranked k JOIN sync_revisions r ON r.rowid=k.seq
+        WHERE k.position<=CASE k.kind WHEN 'day' THEN 7 ELSE 4 END GROUP BY r.rowid ORDER BY r.created DESC,r.rowid DESC`)
+            .bind(account,account).all();
+        const removed=await db.prepare(`SELECT revision AS id,parent,branch,card,removed AS created
+            FROM card_recycle WHERE account=? AND removed>unixepoch()-2592000 ORDER BY removed DESC`).bind(account).all();
+        return Response.json([...removed.results,...results]);
+    }
     if(path.startsWith('/sync/') && method==='GET' && hash.test(path.slice(6))){
         const row=await db.prepare('SELECT manifest FROM sync_revisions WHERE account=? AND id=?').bind(account,path.slice(6)).first();
         if(!row)reject(404,'找不到所选修订');
@@ -25,10 +41,12 @@ export async function prepareSync(db,account,m,sha){
         typeof m.label!=='string'||m.label.length>160||
         ['cards','deleted','points'].some(k=>!Array.isArray(m[k])||m[k].some(v=>typeof v!=='string'||v.length>200)))
         reject(400,'同步清单无效');
+    const restored=m.restored??[];
+    if(!Array.isArray(restored)||(restored.length && m.recoveryVersion!==1)||restored.some(id=>!m.cards.includes(id)||m.deleted.includes(id)))reject(400,'单卡恢复清单无效');
     const turns=m.turns||[];
     if(!Array.isArray(turns)||turns.length>5000||turns.some(t=>!t||[t.story,t.message,t.token].some(v=>typeof v!=='string'||!v||v.length>300)||
         !(t.first===null && t.record===null || hash.test(t.first||'') && hash.test(t.record||''))))reject(400,'游戏回合清单无效');
-    const manifest=JSON.stringify({...(m.imageVersion===1?{imageVersion:1}:{}),...(m.gameVersion===1?{gameVersion:1}:{}),root:m.root,parts:m.parts,parent:m.parent,branch:m.branch,label:m.label,cards:m.cards,deleted:m.deleted,points:m.points,...(turns.length?{turns}:{})});
+    const manifest=JSON.stringify({...(m.imageVersion===1?{imageVersion:1}:{}),...(m.gameVersion===1?{gameVersion:1}:{}),...(m.recoveryVersion===1?{recoveryVersion:1}:{}),...(restored.length?{restored}:{}),root:m.root,parts:m.parts,parent:m.parent,branch:m.branch,label:m.label,cards:m.cards,deleted:m.deleted,points:m.points,...(turns.length?{turns}:{})});
     const conflict=`SELECT g.revision FROM json_each(?) t JOIN game_turns g ON g.account=?
         AND g.story=t.value->>'$.story' AND g.message=t.value->>'$.message' AND g.token=t.value->>'$.token'
         WHERE g.first IS NOT (t.value->>'$.first')`;
@@ -37,9 +55,10 @@ export async function prepareSync(db,account,m,sha){
         const previous=await db.prepare('SELECT manifest,branch FROM sync_revisions WHERE account=? AND id=?').bind(account,m.parent).first();
         if(previous?.branch!==m.branch)reject(409,'同步基线不属于此分支');
         const before=JSON.parse(previous.manifest);
+        if(before.recoveryVersion===1 && m.recoveryVersion!==1)reject(409,'此分支含单卡恢复记录，请使用支持回收站的客户端同步');
         if(before.imageVersion && m.imageVersion!==1)reject(409,'此进度已有图库，请更新客户端或恢复完整本机档案');
         if(before.turns?.length && m.gameVersion!==1)reject(409,'此进度含独立游戏存档，请更新客户端后继续同步');
-        if(!same(before.cards,[...m.cards,...m.deleted])||!same(before.points,m.points)||!same(before.deleted,m.deleted)||m.cards.some(k=>m.deleted.includes(k)))
+        if(!same(before.cards,[...m.cards,...m.deleted])||!same(before.points,m.points)||!same(before.deleted,[...m.deleted,...restored])||m.cards.some(k=>m.deleted.includes(k)))
             reject(409,'本机缺少已确认的角色、删除记录或存档点，已保留上一份云档');
     }
     // A diverging device gets its own tip. The trigger advances it only on a new, complete insertion.

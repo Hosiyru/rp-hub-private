@@ -81,7 +81,7 @@
     async function sessionReady() {
         account=await api('/me');
         RPPrivateSync.reset();$('jobList').replaceChildren();$('jobOutput').textContent='';
-        RPPrivateAPI.save({...saved(),account:account.id,syncVersion:linked.syncVersion,gameVersion:linked.gameVersion,imageVersion:linked.imageVersion});
+        RPPrivateAPI.save({...saved(),account:account.id,syncVersion:linked.syncVersion,gameVersion:linked.gameVersion,imageVersion:linked.imageVersion,recoveryVersion:linked.recoveryVersion});
         if(linked.syncVersion===1)RPPrivateSync.restoreMode(local.getItem('__rph_mode_'+journalKey()));
         show('jobs',linked.syncVersion===1);show('sync',linked.syncVersion===1);$('syncMode').value=RPPrivateSync.mode();renderSync();
         RPPrivateSync.schedule(1000);
@@ -104,7 +104,7 @@
         if(!res.ok)throw Error('无法连接私人站点。可返回本地游玩，稍后重试。');
         const info=await res.json();
         if(info.service!=='rp-hub-private'||info.version!==1||!/^[a-f0-9]{32}$/.test(info.site))throw Error('该地址未部署兼容的 RP-Hub 私人站点');
-        linked={site:info.site,origin,release:info.release,claimed:info.claimed,syncVersion:info.syncVersion||0,gameVersion:info.gameVersion||0,imageVersion:info.imageVersion||0};pairTicket=ticket;
+        linked={site:info.site,origin,release:info.release,claimed:info.claimed,syncVersion:info.syncVersion||0,gameVersion:info.gameVersion||0,imageVersion:info.imageVersion||0,recoveryVersion:info.recoveryVersion||0};pairTicket=ticket;
         resetRelease();account=null;preview=null;
         $('address').value=origin;$('where').textContent=origin;$('result').replaceChildren();
         for(const id of ['account','migration','health','comparison','ticketBox','jobs','sync'])show(id,false);

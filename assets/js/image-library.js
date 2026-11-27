@@ -126,5 +126,17 @@
             };await finish(tx);
         });
     }
-    window.RPImages={resolve,list,catalog,fork,params,remove,device,getOriginal:d=>get('originals',d),raster};
+    async function retireOwners(ids){
+        if(!(await factory.databases()).some(d=>d.name==='RPImageLibrary'))return;
+        const db=await database(),tx=db.transaction(['slots','originals'],'readwrite'),finished=finish(tx);
+        const slots=tx.objectStore('slots'),all=await pending(slots.getAll());
+        const removed=new Set(),retained=new Set();
+        for(const slot of all){
+            if(ids.includes(slot.owner)){slots.delete(key(slot));if(slot.digest)removed.add(slot.digest);}
+            else if(slot.digest)retained.add(slot.digest);
+        }
+        for(const digest of removed)if(!retained.has(digest))tx.objectStore('originals').delete(digest);
+        await finished;
+    }
+    window.RPImages={retireOwners,resolve,list,catalog,fork,params,remove,device,getOriginal:d=>get('originals',d),raster};
 })();

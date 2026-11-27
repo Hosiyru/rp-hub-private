@@ -41,7 +41,10 @@
         if(meta.length>3500)throw Error('同步目录超过当前版本上限，本地档已保留');
         const inv=RPLocalArchive.inventory(pkg)[run.id];
         const manifest={gameVersion:1,root,parts:[...pieces.keys()].sort(),label:summary.names[0]||'游玩进度',cards:inv.cards,deleted:inv.deleted||[],
-            points:points.map(p=>p.time+'/'+p.name)};
+            points:points.filter(p=>!p.recycle).map(p=>p.time+'/'+p.name)};
+        const restored=(inv.restored||[]).filter(id=>inv.cards.includes(id)&&!manifest.deleted.includes(id));
+        if(restored.length)manifest.restored=restored;
+        if(restored.length||points.some(p=>p.recycle))manifest.recoveryVersion=1;
         const pictures=run.state.dbs.find(d=>d.name==='RPImageLibrary');
         if(pictures){
             const originals=new Set((pictures.stores.find(s=>s.name==='originals')?.rows||[]).map(r=>r[0]));
@@ -55,7 +58,7 @@
         if(turns.length)manifest.turns=turns;
         return {manifest,pieces};
     }
-    async function unpack(manifest,read) {
+    async function openBackup(manifest,read) {
         const allowed=new Set(manifest.parts);
         async function bytes(id) {
             if(!allowed.has(id))throw Error('分块未列在清单内');
@@ -70,17 +73,24 @@
             return decoder.decode(await new Blob(data).arrayBuffer());
         }
         const meta=JSON.parse(await join(JSON.parse(await join([manifest.root]))));
-        const blocks=Object.create(null);
-        for(const [id,recipe] of meta.blocks){
-            if(Array.isArray(recipe)){blocks[id]=await join(recipe);continue;}
+        const recipes=new Map(meta.blocks);
+        async function readBlock(id){
+            const recipe=recipes.get(id);
+            if(!recipe)throw Error('备份清单缺少所需的数据块');
+            if(Array.isArray(recipe))return join(recipe);
             const messages=[];
             for(const ids of recipe.groups)for(const entry of JSON.parse(await join(ids)))
                 messages.push(entry.parts?JSON.parse(await join(entry.parts)):entry.value);
-            blocks[id]=JSON.stringify(['array',messages]);
+            return JSON.stringify(['array',messages]);
         }
+        return {meta,readBlock};
+    }
+    async function unpack(manifest,read){
+        const {meta,readBlock}=await openBackup(manifest,read),blocks=Object.create(null);
+        for(const [id] of meta.blocks)blocks[id]=await readBlock(id);
         const body={version:1,active:'main',runs:[{id:'main',name:manifest.label,state:meta.state,points:meta.points}],blocks};
         const pkg={type:'rp-hub-local',body,digest:await RPLocalArchive.codec.hash(JSON.stringify(body))};
         return RPLocalArchive.readPackage(JSON.stringify(pkg));
     }
-    window.RPSyncFormat={pack,unpack,digest};
+    window.RPSyncFormat={pack,unpack,openBackup,digest};
 })();

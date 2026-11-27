@@ -26,8 +26,10 @@
         if(!port||writing||!changed) return;
         writing=true;changed=false;
         try {
+            const pendingRestore=RPLocalScope.disk.getItem('__rph_mirror_after_restore');
             const pkg=await RPLocalArchive.portable();
             await write(JSON.stringify(pkg),'mirror',{digest:pkg.digest,inventory:RPLocalArchive.inventory(pkg)});
+            if(pendingRestore && pendingRestore===RPLocalScope.disk.getItem('__rph_mirror_after_restore'))RPLocalScope.disk.removeItem('__rph_mirror_after_restore');
             status('最近完整副本已就绪');
         } catch(e){explain(e.message);console.warn('手机副本：',e.message);}
         finally {writing=false;if(changed)dirty();}
@@ -57,7 +59,7 @@
                 location.replace('/local.html?recover');
             }
         }
-        if(changed)dirty();
+        if(changed||RPLocalScope.disk.getItem('__rph_mirror_after_restore'))dirty();
     });
     async function read(slot) {
         const token=await call('read',{slot});let str='';

@@ -51,7 +51,7 @@ async function handle(req,env,ctx) {
     const keyHash=(purpose,value)=>sha(site+'/'+purpose+'/'+value);
     if(path==='/site' && method==='GET'){
         const owner=await db.prepare("SELECT 1 AS ok FROM accounts WHERE role='owner'").first();
-        return json({service:'rp-hub-private',version:1,syncVersion:1,gameVersion:1,imageVersion:1,release:installed,site,claimed:!!owner});
+        return json({service:'rp-hub-private',version:1,syncVersion:1,gameVersion:1,imageVersion:1,recoveryVersion:1,release:installed,site,claimed:!!owner});
     }
     if(req.headers.get('X-RP-Site')!==site) problem(409,'站点身份发生变化，请重新选择站点');
     const mint=async account=>{

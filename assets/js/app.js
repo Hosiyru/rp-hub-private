@@ -6460,21 +6460,29 @@ const app = createApp({
                 .map(name => deleteScopedStoredValue(name, id))));
 
             if (!char.uuid) return;
+            await Promise.all(['image_renders','character'].map(name=>deleteScopedStoredValue(name,char.uuid)));
             ensureGlobalUiTemplates().forEach(template => {
                 if (!template.runtimeByCharacter) return;
                 [char.uuid, ...allBranchScopeIds].forEach(scopeId => delete template.runtimeByCharacter[scopeId]);
             });
         };
 
-        const finishCharacterDeletion = async (deleted) => {
-            await Promise.all([
-                saveCharactersNow(deleted),
-                saveMemorySettingsNow(),
-                setStoredValue('global_ui_templates', globalUiTemplates.value),
-                currentCharacterIndex.value >= 0
-                    ? setStoredValue('last_active_char', currentCharacterIndex.value)
-                    : deleteStoredValue('last_active_char')
-            ]);
+        const finishCharacterDeletion = () => currentCharacterIndex.value >= 0
+            ? setStoredValue('last_active_char', currentCharacterIndex.value)
+            : deleteStoredValue('last_active_char');
+
+        const clearDeletedAssets = async ids => {
+            await RPImages.retireOwners(ids);
+            const factory=RPLocalScope.storageFactory;
+            for(const d of await factory.databases()){
+                if(!d.name.startsWith('fate-moment-rebuild@'))continue;
+                const owner=getStoryBranchOwnerId(d.name.slice('fate-moment-rebuild@'.length));
+                if(ids.includes(owner)){
+                    const req=factory.deleteDatabase(d.name);
+                    // Older open game frames may still hold their connection. The saved copy remains recoverable.
+                    await new Promise((ok,no)=>{req.onsuccess=req.onblocked=ok;req.onerror=()=>no(req.error);});
+                }
+            }
         };
 
         const stopCurrentCharacterWork = async () => {
@@ -6505,32 +6513,39 @@ const app = createApp({
             _classicMemoriesLoaded = false;
         };
 
-        const deleteCharacter = (index) => {
-            confirmAction('确定要删除这个角色吗？此操作无法撤销。', async () => {
-                try {
-                    const char = characters.value[index];
-                    if (!char) return;
-                    const isCurrent = currentCharacterIndex.value === index;
-                    if (isCurrent && !await stopCurrentCharacterWork()) return;
+        const removeCharacters = async (ids,batch=false) => {
+            let committed=false;
+            try {
+                const targets=ids.map(id=>{
+                    const card=characters.value.find(c=>c.uuid===id);
+                    if(!card)throw Error('角色列表已变化，请重新选择');
+                    return card;
+                });
+                const active=currentCharacter.value?.uuid;
+                if(ids.includes(active) && !await stopCurrentCharacterWork())return;
+                if(!getMainDb())await initDB();
+                const keys=(await Promise.all([readStorageKeys(getMainDb()),readStorageKeys(getLegacyDb())])).flat();
+                const {stamp,indices}=await RPLocalArchive.beforeDelete(ids);
+                suspendCharacterAutoSave=true;
+                // Commit the tombstones and latest verified index before freeing any content.
+                characters.value=await RPLocalLibrary.reconcile(getMainDb(),undefined,ids,stamp);
+                committed=true;
+                if(ids.includes(active))clearCurrentCharacterData();
+                else currentCharacterIndex.value=characters.value.findIndex(c=>c.uuid===active);
+                for(const [i,target] of targets.entries())await deleteCharacterData(target,indices[i],keys);
+                await finishCharacterDeletion();
+                await clearDeletedAssets(ids);
+                if(batch)toggleBatchDeleteMode();
+                showToast('角色已移入回收站','success');
+            }catch(err){
+                console.error('Character deletion:',err);
+                showToast((committed?'删除副本已保留，清理未完成：':'未删除：')+(err.message||'存档操作失败'),'error');
+            }finally{suspendCharacterAutoSave=false;}
+        };
 
-                    await deleteCharacterData(char, index);
-
-                    suspendCharacterAutoSave = true;
-                    characters.value.splice(index, 1);
-                    if (isCurrent) {
-                        clearCurrentCharacterData();
-                    } else if (currentCharacterIndex.value > index) {
-                        currentCharacterIndex.value--;
-                    }
-                    await finishCharacterDeletion([char.uuid]);
-                    showToast('角色已删除', 'success');
-                } catch (err) {
-                    console.error('Failed to delete character or associated data:', err);
-                    showToast('删除角色失败', 'error');
-                } finally {
-                    suspendCharacterAutoSave = false;
-                }
-            });
+        const deleteCharacter = index => {
+            const id=characters.value[index]?.uuid;if(!id)return;
+            confirmAction('确定删除这个角色？可在「本地存档 → 单卡恢复」中找回，删除副本保留 30 天。',()=>removeCharacters([id]));
         };
 
         const toggleCharacterFavorite = (index) => {
@@ -6568,48 +6583,8 @@ const app = createApp({
         };
 
         const batchDeleteCharacters = () => {
-            if (selectedCharacterIndices.value.size === 0) return;
-
-            confirmAction(`确定要删除选中的 ${selectedCharacterIndices.value.size} 个角色吗？此操作无法撤销。`, async () => {
-                try {
-                    const currentUUID = currentCharacter.value ? currentCharacter.value.uuid : null;
-                    const indices = Array.from(selectedCharacterIndices.value).sort((a, b) => b - a);
-                    const deleted = indices.map(index => characters.value[index]?.uuid).filter(Boolean);
-                    const deletingCurrent = indices.includes(currentCharacterIndex.value);
-                    if (deletingCurrent && !await stopCurrentCharacterWork()) return;
-                    if (!getMainDb()) await initDB();
-                    const storageKeys = (await Promise.all([
-                        readStorageKeys(getMainDb()),
-                        readStorageKeys(getLegacyDb())
-                    ])).flat();
-
-                    suspendCharacterAutoSave = true;
-                    for (const index of indices) {
-                        const char = characters.value[index];
-                        if (!char) continue;
-                        await deleteCharacterData(char, index, storageKeys);
-                        characters.value.splice(index, 1);
-                    }
-
-                    if (deletingCurrent) {
-                        clearCurrentCharacterData();
-                    } else if (currentUUID) {
-                        const newIndex = characters.value.findIndex(c => c.uuid === currentUUID);
-                        currentCharacterIndex.value = newIndex;
-                    } else {
-                        currentCharacterIndex.value = -1;
-                    }
-
-                    await finishCharacterDeletion(deleted);
-                    showToast('删除成功', 'success');
-                    toggleBatchDeleteMode();
-                } catch (err) {
-                    console.error('Batch delete failed:', err);
-                    showToast('删除失败', 'error');
-                } finally {
-                    suspendCharacterAutoSave = false;
-                }
-            });
+            const ids=[...selectedCharacterIndices.value].map(i=>characters.value[i]?.uuid).filter(Boolean);
+            if(ids.length)confirmAction(`确定删除选中的 ${ids.length} 个角色？每张卡的删除副本保留 30 天。`,()=>removeCharacters(ids,true));
         };
 
         const enforceSpecialRules = () => {

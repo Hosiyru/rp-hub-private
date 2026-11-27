@@ -9,6 +9,13 @@
 <details><summary>迁入旧魔改分片档</summary><p>有旧站地址时，在 Windows 下载并运行<a href="assets/legacy-download.ps1" download>旧站存档下载工具</a>，输入旧站地址和同步口令，再用「选择档案导入」打开得到的 .rphsave 文件。已有 R2 文件的玩家可在电脑上直接选择含 manifest.json 和 chunks 的目录。</p>
 <button type="button" id="chooseLegacy">选择旧分片目录</button><input id="legacyDir" type="file" webkitdirectory multiple hidden></details>
 <div id="review" hidden><p id="summary"></p><div class="row"><button id="apply" class="primary">导入为独立进度</button><button id="cancel">取消</button></div></div></section>
+<section id="singleCard" aria-labelledby="restoreTitle"><h2 id="restoreTitle">单卡恢复</h2>
+<p>删除副本保留 30 天。也可选择命名存档点，或在上方打开换机档案。找回后会打开一份新进度，包含所选角色和其他角色的最新数据。恢复前的进度也可切回。</p>
+<button id="listCloudBackups" type="button" hidden>查看私人站点备份</button>
+<label for="restoreSource">恢复来源</label><select id="restoreSource"></select>
+<button id="inspectCard" type="button">查看可恢复角色</button>
+<div id="restoreChoice" hidden><label for="restoreCardId">角色实例</label><select id="restoreCardId"></select>
+<button id="restoreOne" type="button">找回所选角色并继续</button></div></section>
 <section id="gallery"><h2>图库</h2><label for="galleryOwner">角色</label><select id="galleryOwner"><option value="">全部角色</option></select>
 <p id="galleryCount" role="status"></p><ul id="imageList"></ul><button type="button" id="moreImages" hidden>显示更多图片</button>
 <div id="imageView" hidden><h3 id="imageTitle"></h3><img id="originalImage" style="max-width:100%;max-height:70vh;object-fit:contain" alt=""><p id="imageInfo"></p>
@@ -20,6 +27,6 @@
 <p role="status" aria-live="polite" id="status"></p></main>
 <script>
 if (location.protocol !== 'file:' && !new URLSearchParams(location.search).has('preview'))
-    for (const name of ['local-scope','local-library','local-archive','local-native','fate-saves','private-api','private-archives','sync-format','private-sync','legacy-shards','image-library','image-provider'])
+    for (const name of ['local-scope','local-library','local-archive','card-recovery','local-native','fate-saves','private-api','private-archives','sync-format','private-sync','legacy-shards','image-library','image-provider'])
         document.write('<script src="assets/js/' + name + '.js"><\/script>');
 </script><script src="assets/js/local-panel.js"></script><script src="assets/js/gallery.js"></script></body></html>

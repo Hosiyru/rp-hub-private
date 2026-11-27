@@ -84,7 +84,7 @@
             if(!data.meaningful && !b)return null;
             if(first && !b && remoteHeads.length && !disk.getItem(prefix(c.s)+'allow/'+scope.id))
                 throw Error('两端均有进度。请先在私人站点选择上传本机另存分支，或拉取云档另开进度。');
-            const manifest={...data.manifest,parent:b?.id||null,branch:b?.branch||'main'};
+            const manifest={...data.manifest,...(b?.recoveryVersion?{recoveryVersion:1}:{}),parent:b?.id||null,branch:b?.branch||'main'};
             work={manifest,stamp:data.stamp};
             c.check();
             const db=await cache();
@@ -100,10 +100,11 @@
             });
         }
         const m=work.manifest;
-        if((m.turns?.length && c.s.gameVersion!==1)||(m.imageVersion && c.s.imageVersion!==1)){
+        if((m.turns?.length && c.s.gameVersion!==1)||(m.imageVersion && c.s.imageVersion!==1)||(m.recoveryVersion && c.s.recoveryVersion!==1)){
             const info=await c.call('/site');
+            if(m.recoveryVersion && info.recoveryVersion!==1)throw Error('请先更新私人站点再同步单卡回收记录；本机删除副本和原云档均已保留');
             if(info.site!==c.s.site || (m.turns?.length && info.gameVersion!==1) || (m.imageVersion && info.imageVersion!==1))throw Error('请升级私人站点以同步游戏存档与图库，本机进度已保留');
-            const capabilities={gameVersion:info.gameVersion||0,imageVersion:info.imageVersion||0};
+            const capabilities={gameVersion:info.gameVersion||0,imageVersion:info.imageVersion||0,recoveryVersion:info.recoveryVersion||0};
             c.check();Object.assign(c.s,capabilities);api.save({...api.session(),...capabilities});
         }
         for(let i=0;i<m.parts.length;i+=128){
@@ -116,24 +117,49 @@
         }
         const result=finalize?await finalize(m):await c.call('/sync',{method:'POST',json:m});
         c.check();
-        const next={...result,root:m.root,stamp:work.stamp,receipt:gameStatus(m.turns)};
+        const next={...result,recoveryVersion:m.recoveryVersion,root:m.root,stamp:work.stamp,receipt:gameStatus(m.turns)};
         setBase(c.s,scope.id,next);
         await store('outbox',s=>s.delete(slot),true);
         return next;
     }
-    async function pull(c,head,automatic=false,official=false) {
-        if(!head)return false;
-        const b=base(c.s);
-        if(head.id===b?.id && !official)return false;
-        const stamp=revision(), m=await c.call('/sync/'+head.id);
+    async function remoteSource(c,head){
+        const m=await c.call('/sync/'+head.id);
         if(await archive.codec.hash(JSON.stringify(m))!==head.id)throw Error('云端修订校验失败，已保留本机进度');
-        const pkg=await RPSyncFormat.unpack(m,async id=>{
+        const read=async id=>{
             const key=partKey(c,id), known=await store('parts',s=>s.get(key));
             if(known)return known;
             const bytes=new Uint8Array(await(await c.call('/chunks/'+id,{raw:true})).arrayBuffer());
             if(await RPSyncFormat.digest(bytes)!==id)throw Error('下载内容不完整，已保留本机进度');
             await store('parts',s=>s.put(bytes,key),true);return bytes;
-        });
+        };
+        return {m,read};
+    }
+    async function backups(){
+        const c=context(false);
+        let list;
+        try{list=await c.call('/sync/backups');}
+        catch(e){if(e.status===404)throw Error('当前私人站点版本尚未提供历史备份列表，可选择本地存档点或档案文件');throw e;}
+        return list.map(row=>({...row,load:async()=>{
+            const open=async id=>{
+                const {m,read}=await remoteSource(c,{id});
+                return RPSyncFormat.openBackup(m,read);
+            };
+            let backup=await open(row.id),state=backup.meta.state;
+            if(row.card){
+                const point=backup.meta.points.filter(p=>p.recycle===row.card).sort((a,b)=>b.time-a.time)[0];
+                if(point)state=point.state;
+                else if(row.parent){backup=await open(row.parent);state=backup.meta.state;}
+                else throw Error('旧客户端首次上传时已删除此卡，云端没有删除前副本，请选择本机或文件备份');
+            }
+            c.check();return {state,blocks:{},readBlock:backup.readBlock,card:row.card,check:c.check};
+        }}));
+    }
+    async function pull(c,head,automatic=false,official=false) {
+        if(!head)return false;
+        const b=base(c.s);
+        if(head.id===b?.id && !official)return false;
+        const stamp=revision(),{m,read}=await remoteSource(c,head);
+        const pkg=await RPSyncFormat.unpack(m,read);
         c.check();
         // Imports are staged outside the live namespace. Even a partial multi-database restore cannot overwrite it.
         const old=(await archive.runs()).find(r=>r.id===scope.id);
@@ -146,7 +172,7 @@
         if(existing && existing.stamp!==revision(id))throw Error('这份云档已在本机继续游玩，可从本机进度打开');
         if(stamp!==revision()||window.RPGameBusy?.())throw Error('本机正在游玩，云档已下载，空闲后可继续');
         c.check();
-        setBase(c.s,id,{id:head.id,branch:head.branch,root:m.root,stamp:revision(id),receipt:gameStatus(m.turns)});
+        setBase(c.s,id,{id:head.id,branch:head.branch,recoveryVersion:m.recoveryVersion,root:m.root,stamp:revision(id),receipt:gameStatus(m.turns)});
         await archive.activate(id);
         if(rotate)disk.setItem('__rph_sync_retire/'+id,JSON.stringify({old:scope.id,next:id,stamp,key:c.key}));
         status('云端已确认，正在打开进度');
@@ -218,6 +244,21 @@
             status('生成任务已由私人站点接收');return job.id;
         });
     }
+    async function restoreCard(source,cardId){
+        const s=api.session(),key=accountKey(s);
+        const apply=async()=>{
+            if(accountKey(api.session())!==key)throw Error('私人站点账号已切换');
+            const b=key && base(s);
+            source.check?.();
+            const recovered=await archive.recoverCard(source,cardId);
+            if(key && accountKey(api.session())!==key)throw Error('私人站点账号已切换，已保留本机恢复副本');
+            source.check?.();
+            if(b)setBase(s,recovered.id,{...b,stamp:null});
+            archive.activateRecovered(recovered);
+            return recovered.id;
+        };
+        return key?navigator.locks.request('rph-sync/'+key,apply):apply();
+    }
     function schedule(ms=1500) {
         clearTimeout(timer);
         if(mode()!=='auto' || document.hidden)return;
@@ -246,7 +287,7 @@
     for(const event of ['online','pageshow','focus'])window.addEventListener(event,()=>schedule(0));
     document.addEventListener('resume',()=>schedule(0));
     document.addEventListener('visibilitychange',()=>schedule(0));
-    window.RPPrivateSync={run,mode,restoreMode,changeMode,schedule,submitJob,get branch(){const s=api.session();return accountKey(s)?base(s)?.branch:null;},get status(){return message;},get heads(){return remoteHeads;},
+    window.RPPrivateSync={run,backups,restoreCard,mode,restoreMode,changeMode,schedule,submitJob,get branch(){const s=api.session();return accountKey(s)?base(s)?.branch:null;},get status(){return message;},get heads(){return remoteHeads;},
         reset(){clearTimeout(timer);remoteHeads=[];status('本机已保存');},get busy(){return !!activity;},allowFirst(){const c=context(false);disk.setItem(prefix(c.s)+'allow/'+scope.id,'1');}};
     const retireKey='__rph_sync_retire/'+scope.id,retire=disk.getItem(retireKey);
     if(retire)archive.retireSyncCopy(JSON.parse(retire)).then(ok=>{if(ok)disk.removeItem(retireKey);}).catch(()=>{});

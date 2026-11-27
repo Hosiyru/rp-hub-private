@@ -40,7 +40,7 @@
             if(key!==dbName)return factory.open(key,...args);
             const req=factory.open(name(story),...args);
             req.addEventListener('upgradeneeded',()=>{if(!req.result.objectStoreNames.contains('initial'))req.result.createObjectStore('initial');});
-            req.addEventListener('success',()=>observe(req.result));
+            req.addEventListener('success',()=>{const db=req.result;db.addEventListener('versionchange',()=>db.close());observe(db);});
             return req;
         }};
     }

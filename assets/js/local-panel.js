@@ -14,10 +14,53 @@
         if(action){const b=document.createElement('button');b.textContent=action;b.onclick=()=>perform(onClick);li.append(b);}
         return li;
     }
+    let sources=[],cloudSources=[],inspected;
+    function refreshSources(points){
+        inspected=null; $('restoreChoice').hidden=true;
+        sources=points.filter(p=>p.run===active).sort((a,b)=>b.time-a.time).map(p=>({
+            label:(p.recycle?'删除副本 · ':'存档点 · ')+p.name+' · '+new Date(p.time).toLocaleString(),
+            load:()=>api.pointSource(p.id)
+        }));
+        if(selected)for(const run of selected.body.runs){
+            for(const p of [{name:'当前',state:run.state},...run.points]){
+                if(p.recycle && p.time<=Date.now()-30*86400000)continue;
+                sources.push({label:'档案 · '+run.name+' · '+p.name,load:()=>({state:p.state,blocks:selected.body.blocks})});
+            }
+        }
+        sources.push(...cloudSources);
+        $('restoreSource').replaceChildren(...(sources.length?sources.map((s,i)=>new Option(s.label,String(i))):[new Option('暂无恢复副本','')]));
+        $('inspectCard').hidden=!sources.length;
+    }
+    $('listCloudBackups').onclick=()=>perform(async()=>{
+        const rows=await RPPrivateSync.backups();
+        cloudSources=rows.map(r=>({label:(r.card?'云端删除副本 · '+r.card:'私人站点 · '+r.label)+' · '+(r.branch==='main'?'主进度':r.branch.slice(0,8))+' · '+new Date(r.created*1000).toLocaleString(),load:r.load}));
+        refreshSources(await api.points());if(rows.length)$('restoreSource').selectedIndex=sources.length-rows.length;
+        message(rows.length?'已读取 '+rows.length+' 个已确认的云端版本':'此账号还没有云端备份');
+    });
+    $('restoreSource').onchange=()=>{inspected=null;$('restoreChoice').hidden=true;};
+    $('inspectCard').onclick=()=>perform(async()=>{
+        inspected=null;$('restoreChoice').hidden=true;
+        const source=await sources[Number($('restoreSource').value)].load();
+        const cards=(await RPCardRecovery.list(source)).filter(c=>c?.uuid && (!source.card||source.card===c.uuid));
+        if(!cards.length)throw Error('这份备份中没有可识别的角色实例');
+        $('restoreCardId').replaceChildren(...cards.map(c=>new Option((c.name||'未命名角色')+' · '+c.uuid,c.uuid)));
+        inspected=source;$('restoreChoice').hidden=false;message('请选择要找回的角色');$('restoreCardId').focus();
+    });
+    $('restoreOne').onclick=()=>perform(async()=>{
+        if(!inspected)return;
+        message('正在核验原图和游戏存档…');
+        await RPPrivateSync.restoreCard(inspected,$('restoreCardId').value);
+        location.replace('index.html');
+    });
     async function refresh() {
         const runs=await api.runs(),cur=runs.find(r=>r.id===active);
         $('context').textContent=(demo?'交互预览 · ':'当前进度 · ')+(cur?.name||'原始进度');
-        $('points').replaceChildren(...(await api.points()).filter(p=>p.run===active).sort((a,b)=>b.time-a.time).map(p=>
+        const points=await api.points();
+        if(!demo){
+            refreshSources(points);const account=RPPrivateAPI.session();
+            $('listCloudBackups').hidden=!account?.account||account.detached;
+        }else $('singleCard').hidden=true;
+        $('points').replaceChildren(...points.filter(p=>p.run===active&&!p.recycle).sort((a,b)=>b.time-a.time).map(p=>
             item(p.name,new Date(p.time).toLocaleString(),'另开分支',async()=>switchTo(await api.fork(p.id)))));
         $('runs').replaceChildren(...runs.map(r=>item(r.name,r.id===active?'正在使用':'',r.id===active?'':'切换',()=>switchTo(r.id))));
     }
@@ -39,7 +82,7 @@
     });
     $('choose').onclick=()=>{if(demo)return message('预览模式。实际游玩时，可预览档案后再确认导入。');$('file').click();};
     async function review(file,legacy=false) {
-        selected=null;$('review').hidden=true;message('正在读取档案…');
+        selected=null;refreshSources(await api.points());$('review').hidden=true;message('正在读取档案…');
         const pkg=legacy?await RPLegacyShards.read(file,(i,total)=>message('正在校验旧分片 '+i+'/'+total)):await api.readPackage(file);
         selected=pkg;
         $('summary').textContent=pkg.body.runs.length+' 份进度，'+pkg.body.runs.reduce((n,r)=>n+r.points.length,0)+' 个命名点。确认后可单独打开，现有进度保留。';
@@ -47,7 +90,8 @@
             const s=pkg.legacy;
             $('summary').textContent='旧魔改进度 · '+s.cards+' 张卡，'+s.messages+' 条消息，'+s.pluginData+' 条插件数据，'+s.scripts+' 份插件脚本，'+s.pluginSettings+' 项插件设置。'+(s.recovered?'从角色正文补回 '+s.recovered+' 张索引遗漏的卡。':'')+'确认后另开进度。';
         }
-        $('review').hidden=false;message('完整性校验通过');
+        refreshSources(await api.points());$('restoreSource').selectedIndex=sources.findIndex(s=>s.label.startsWith('档案 · '));
+        $('review').hidden=false;message('完整性校验通过。也可在「单卡恢复」中只找回一张卡。');
     }
     $('chooseLegacy').onclick=()=>{if(demo)return message('预览模式。实际游玩时可选择旧分片目录。');$('legacyDir').click();};
     for(const [input,button] of [['file','choose'],['legacyDir','chooseLegacy']]){
@@ -59,7 +103,7 @@
             if(selected)$('apply').focus();else returnFocus.focus();
         };
     }
-    $('cancel').onclick=()=>{selected=null;$('review').hidden=true;(returnFocus||$('choose')).focus();message('已取消导入');};
+    $('cancel').onclick=async()=>{selected=null;refreshSources(await api.points());$('review').hidden=true;(returnFocus||$('choose')).focus();message('已取消导入');};
     $('apply').onclick=()=>perform(async()=>{if(selected)await switchTo(await api.importPackage(selected));});
     if(location.hostname==='rphub.local'){
         $('native').hidden=false;
