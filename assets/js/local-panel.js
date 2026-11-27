@@ -24,7 +24,7 @@
         if(selected)for(const run of selected.body.runs){
             for(const p of [{name:'当前',state:run.state},...run.points]){
                 if(p.recycle && p.time<=Date.now()-30*86400000)continue;
-                sources.push({label:'档案 · '+run.name+' · '+p.name,load:()=>({state:p.state,blocks:selected.body.blocks})});
+                sources.push({label:'档案 · '+run.name+' · '+p.name,load:()=>({state:p.state,blocks:selected.body.blocks||{},readBlock:selected.readBlock})});
             }
         }
         sources.push(...cloudSources);
@@ -64,6 +64,12 @@
             item(p.name,new Date(p.time).toLocaleString(),'另开分支',async()=>switchTo(await api.fork(p.id)))));
         $('runs').replaceChildren(...runs.map(r=>item(r.name,r.id===active?'正在使用':'',r.id===active?'':'切换',()=>switchTo(r.id))));
     }
+    $('verifyArchive').hidden=demo;
+    $('verifyArchive').onclick=()=>perform(async()=>{
+        const source=await RPCaptureCache.collect(active,true);
+        for(const id of RPImageRemovals.refs(source.body.runs.flatMap(r=>[r.state,...r.points.map(p=>p.state)])))await source.readBlock(id);
+        source.check();message('当前进度和存档点的全部数据块已核对');
+    });
     async function switchTo(id) {await api.activate(id); if(demo){active=id;await refresh();}else location.replace('index.html');}
     if(demo) {
         active='main';const runs=[{id:active,name:'原始进度'}],points=[{id:'example',run:active,name:'进入矿坑前',time:Date.now()}];
@@ -76,14 +82,27 @@
     $('pointForm').onsubmit=e=>{e.preventDefault();perform(async()=>{const name=$('name').value.trim();if(!name)throw Error('请输入存档名称');await api.checkpoint(name);$('name').value='';await refresh();message('已创建存档点');window.RPLocalNative?.dirty();});};
     $('export').onclick=()=>perform(async()=>{
         if(demo)return message('预览模式。实际游玩时，此处导出本机完整档案。');
-        const str=JSON.stringify(await RPFirstConnection.forTransfer(await api.portable())),name='RP-Hub-'+new Date().toISOString().slice(0,10)+'.json';
-        if(window.RPLocalNative?.available()) {await RPLocalNative.exportFile(str,name);message('已写入所选文件');}
-        else {const url=URL.createObjectURL(new Blob([str],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),60000);message('已交给浏览器下载');}
+        const name='RP-Hub-'+new Date().toISOString().slice(0,10)+'.jsonl';
+        if(window.RPLocalNative?.available()){
+            const plan=await RPArchiveStream.prepare();
+            await RPLocalNative.exportFile(plan.lines(),name);message('已写入所选文件');return;
+        }
+        const target=window.showSaveFilePicker?await showSaveFilePicker({suggestedName:name}):null;
+        const plan=await RPArchiveStream.prepare();
+        if(target){
+            const writer=await target.createWritable();
+            try{for await(const line of plan.lines())await writer.write(line);await writer.close();}
+            catch(e){await writer.abort().catch(()=>{});throw e;}
+            message('已写入所选文件');return;
+        }
+        const url=URL.createObjectURL(await RPArchiveStream.fileOf(plan.lines()));
+        const a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),60000);message('已交给浏览器下载');
     });
     $('choose').onclick=()=>{if(demo)return message('预览模式。实际游玩时，可预览档案后再确认导入。');$('file').click();};
     async function review(file,legacy=false) {
         selected=null;refreshSources(await api.points());$('review').hidden=true;message('正在读取档案…');
-        const pkg=legacy?await RPLegacyShards.read(file,(i,total)=>message('正在校验旧分片 '+i+'/'+total)):await api.readPackage(file);
+        if(file instanceof Blob && file.size>64*1024*1024 && !await RPArchiveStream.isFile(file))message('正在读取旧格式大档。导入后可重新导出为逐块校验的新版档案。');
+        const pkg=legacy?await RPLegacyShards.read(file,(i,total)=>message('正在校验旧分片 '+i+'/'+total)):file?.readBlock?file:await api.readPackage(file);
         selected=pkg;
         $('summary').textContent=pkg.body.runs.length+' 份进度，'+pkg.body.runs.reduce((n,r)=>n+r.points.length,0)+' 个命名点。确认后可单独打开，现有进度保留。';
         if(pkg.legacy){
@@ -91,7 +110,7 @@
             $('summary').textContent='旧魔改进度 · '+s.cards+' 张卡，'+s.messages+' 条消息，'+s.pluginData+' 条插件数据，'+s.scripts+' 份插件脚本，'+s.pluginSettings+' 项插件设置。'+(s.recovered?'从角色正文补回 '+s.recovered+' 张索引遗漏的卡。':'')+'确认后另开进度。';
         }
         refreshSources(await api.points());$('restoreSource').selectedIndex=sources.findIndex(s=>s.label.startsWith('档案 · '));
-        $('review').hidden=false;message('完整性校验通过。也可在「单卡恢复」中只找回一张卡。');
+        $('review').hidden=false;message(file?.readBlock?'副本目录已核对，恢复时将逐块校验。':'完整性校验通过。也可在「单卡恢复」中只找回一张卡。');
     }
     $('chooseLegacy').onclick=()=>{if(demo)return message('预览模式。实际游玩时可选择旧分片目录。');$('legacyDir').click();};
     for(const [input,button] of [['file','choose'],['legacyDir','chooseLegacy']]){
@@ -107,8 +126,10 @@
     $('apply').onclick=()=>perform(async()=>{if(selected)await switchTo(await api.importPackage(selected));});
     if(location.hostname==='rphub.local'){
         $('native').hidden=false;
-        $('recover').onclick=()=>perform(async()=>review(await RPLocalNative.read('current')));
-        $('older').onclick=()=>perform(async()=>review(await RPLocalNative.read('previous')));
+        $('autoMirror').checked=RPLocalNative.enabled();
+        $('autoMirror').onchange=e=>RPLocalNative.setEnabled(e.target.checked);
+        $('recover').onclick=()=>perform(async()=>review(await RPLocalNative.readBackup('current')));
+        $('older').onclick=()=>perform(async()=>review(await RPLocalNative.readBackup('previous')));
         window.addEventListener('rph-mirror-status',e=>$('mirrorStatus').textContent=e.detail);
     }
     await refresh();

@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>图库 · RP-Hub</title><link rel="stylesheet" href="assets/css/theme.css"><link rel="stylesheet" href="assets/css/styles.css"><link rel="stylesheet" href="assets/css/gallery.css">
+<script src="assets/js/theme.js"></script></head>
+<body>
+<aside class="rail" aria-label="图库分组">
+  <header class="rail-head"><div><h1><span data-icon="image"></span>图库</h1><p id="summary"></p></div><button id="menu" class="tool" aria-label="打开导航" title="打开导航" data-icon="menu"></button></header>
+  <form id="searchForm" role="search"><span data-icon="search"></span><input id="search" type="search" aria-label="搜索角色或提示词" placeholder="搜索角色或提示词"></form>
+  <div class="rail-scroll"><nav id="groups" aria-label="图片分组"></nav><h2 class="section-label">角色</h2><nav id="owners" aria-label="按角色看图"></nav></div>
+  <section id="cloudCapacity" hidden><button id="refreshUsage" title="刷新用量"><b>私人站点 R2</b><span id="cloudUsage"></span></button><div class="meter"><i></i></div></section>
+</aside>
+<main><header class="top"><button id="back" class="tool" aria-label="返回角色列表" data-icon="back"></button><div class="heading"><h2 id="title">全部图片</h2><p id="galleryCount" aria-live="polite"></p></div>
+<div class="tools"><button id="refresh" class="tool" title="刷新图库" aria-label="刷新图库" data-icon="refresh"></button>
+<button id="blur" class="tool" title="遮挡缩略图" aria-label="遮挡缩略图" aria-pressed="true" data-icon="eye"></button>
+<button id="stars" class="action settings-action"><span data-icon="star"></span>保留图片</button>
+<button id="all" class="action" hidden>全选</button><button id="cancel" class="action" hidden>取消</button></div></header>
+<div class="gallery-scroll"><div id="imageList" class="grid"></div><p id="empty" class="empty-state" hidden></p><button id="moreImages" class="action" hidden>显示更多图片</button></div>
+<div id="dock" hidden><strong id="picked" role="status"></strong><div><button id="unset" class="action">取消保留</button><button id="set" class="action primary">设为保留</button></div></div>
+<p id="status" role="status"></p></main>
+<dialog id="imageView" aria-labelledby="imageTitle"><div class="viewer">
+<header><div><h2 id="imageTitle"></h2><span id="position"></span></div><button id="close" class="tool" autofocus aria-label="关闭大图" data-icon="close"></button></header>
+<div class="stage"><button id="prev" class="tool" aria-label="上一张" data-icon="back"></button><img id="originalImage" alt="" hidden><p id="missing"></p><button id="next" class="tool" aria-label="下一张" data-icon="next"></button></div>
+<footer><p id="prompt"></p><p id="imageInfo"></p><p id="places"></p><div class="viewer-actions"><a id="saveOriginal" class="action" download hidden>下载原图</a><button id="removeImage" class="action danger" hidden>删除原图</button>
+<button id="restoreImage" class="action" hidden>从文件补回原图</button><input id="originalFile" type="file" accept="image/*" hidden>
+<label id="legacyLabel" hidden>原魔改站地址 <input id="legacySite" type="url" placeholder="https://…"><button class="action" id="readLegacy">读取旧站原图</button></label></div><p id="viewerStatus" role="status"></p></footer>
+</div></dialog>
+<script>
+if (window === window.parent && location.protocol !== 'file:') {
+    for (const name of ['local-scope','local-library','local-archive','capture-cache','archive-stream','card-recovery','local-native','private-api','private-archives','image-removals','sync-format','private-sync','image-thumbs','image-library','image-provider'])
+        document.write('<script src="assets/js/'+name+'.js"><\/script>');
+}
+</script><script src="assets/js/gallery.js"></script></body></html>

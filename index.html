@@ -100,7 +100,7 @@
         <app-navigation :current-view="currentView" :open="isNavigationOpen"
             :memory-processing="isActiveBatchExtracting"
             :ui-template-running="uiTemplateUpdateStatus.state === 'running'" :user="user"
-            @update:current-view="currentView = $event"
+            @update:current-view="$event === 'gallery' ? openLocalArchives('gallery') : currentView = $event"
             @close="closeNavigation"></app-navigation>
 
         <div class="app-main flex-1 flex flex-col h-full overflow-hidden bg-gray-50 relative" :inert="isNavigationOpen">
@@ -1064,6 +1064,9 @@
                     loading-text="加载小说生成中..." @menu="toggleNavigation" @load="onNovelLoad">
                 </embedded-view-content>
             </div>
+
+            <iframe v-if="currentView === 'gallery'" src="./gallery.html" title="图库" class="w-full flex-1 min-h-0 border-0"
+                @gallery-menu="toggleNavigation" @gallery-image-change="refreshGalleryImage($event.detail)"></iframe>
 
             <!-- Settings View -->
             <div v-if="currentView === 'settings'" class="management-view settings-view">
@@ -2536,7 +2539,7 @@
 
     <script>
         (function (stamp) {
-            ['local-library', 'local-archive', 'card-recovery', 'local-native', 'private-api', 'private-archives', 'sync-format', 'private-sync', 'private-jobs', 'image-library', 'image-provider', 'built-in-content', 'core-utils', 'api-utils', 'data-services', 'runtime-services', 'cloud-backup',
+            ['local-library', 'local-archive','capture-cache','archive-stream', 'card-recovery', 'local-native', 'private-api', 'private-archives', 'image-removals', 'sync-format', 'private-sync', 'private-jobs', 'image-thumbs','image-library', 'image-provider', 'built-in-content', 'core-utils', 'api-utils', 'data-services', 'runtime-services', 'cloud-backup',
                 'update-check', 'ui-components', 'app'].forEach(name => {
                 document.write('<script src="assets/js/' + name + '.js?v=' + stamp + '"><\/script>');
             });

@@ -15,30 +15,76 @@
         if(secret.test(key)||legacyImageKey.test(key)||/ai_chargen_api|cloud_backup/i.test(key))return '';
         try{const parsed=JSON.parse(value),clean=JSON.stringify(scrub(parsed));return clean===JSON.stringify(parsed)?value:clean;}catch{return scrub(value);}
     }
-    async function forTransfer(pkg) {
-        const blocks={}, mapped=new Map();
+    const sanitizeKind=(db,key)=>db!=='RPHubDB'?'plain':legacyImageKey.test(key)?'key':typeof key==='string'&&key.startsWith('rp_hub_image_renders_')?'bucket':'plain';
+    async function cleanText(text,kind){
+        if(kind==='key')return JSON.stringify('');
+        if(kind==='bucket'||/api.?key|apiProviderKeys|imageGenKey|access.?token|refresh.?token|authorization|password|client.?secret|[?&]token=/i.test(text))
+            return JSON.stringify(await encode(scrub(decode(JSON.parse(text)),kind==='bucket')));
+        return text;
+    }
+    async function forTransfer(pkg){
+        const blocks={},mapped=new Map();
         for(const run of pkg.body.runs)for(const state of [run.state,...run.points.map(p=>p.state)]){
             state.storage=state.storage.map(([k,v])=>[k,scrubSetting(k,v)]);
             for(const db of state.dbs)for(const store of db.stores)for(const row of store.rows){
-                const old=row[1];
-                const imageBucket=db.name==='RPHubDB' && typeof row[0]==='string' && row[0].startsWith('rp_hub_image_renders_');
-                const imageKey=db.name==='RPHubDB' && legacyImageKey.test(row[0]);
-                const cacheKey=(imageBucket?'image/':imageKey?'key/':'')+old;
-                if(!mapped.has(cacheKey)){
-                    const text=pkg.body.blocks[old];
-                    // Never rewrite binary records simply to sanitize a model setting.
-                    let next=text;
-                    if(imageKey)next=JSON.stringify('');
-                    else if(imageBucket||/api.?key|apiProviderKeys|imageGenKey|access.?token|refresh.?token|authorization|password|client.?secret|[?&]token=/i.test(text))
-                        next=JSON.stringify(await encode(scrub(decode(JSON.parse(text)),imageBucket)));
-                    const key=next===text?old:await hash(next);
-                    blocks[key]=next;mapped.set(cacheKey,key);
+                const id=row[1],kind=sanitizeKind(db.name,row[0]),key=kind+'/'+id;
+                if(!mapped.has(key)){
+                    const text=pkg.body.blocks[id],next=await cleanText(text,kind),out=next===text?id:await hash(next);
+                    mapped.set(key,out);blocks[out]=next;
                 }
-                row[1]=mapped.get(cacheKey);
+                row[1]=mapped.get(key);
             }
         }
-        pkg.body.blocks=blocks;
-        pkg.digest=await hash(JSON.stringify(pkg.body));
+        pkg.body.blocks=blocks;pkg.digest=await hash(JSON.stringify(pkg.body));return pkg;
+    }
+    async function transferSource(source){
+        const original=source.readBlock,index=new Map(),addresses=new Map(),body=source.body;
+        for(const run of body.runs)for(const state of [run.state,...run.points.map(p=>p.state)]){
+            state.storage=state.storage.map(([k,v])=>[k,scrubSetting(k,v)]);
+            for(const db of state.dbs)for(const store of db.stores)for(const row of store.rows){
+                const id=row[1],kind=sanitizeKind(db.name,row[0]),key=kind+'/'+id;
+                let out=addresses.get(key);
+                if(!out){
+                    out=await RPCaptureCache.recipe(id,'clean/'+kind,async()=>{
+                        const text=await original(id),clean=await cleanText(text,kind);return clean===text?id:await hash(clean);
+                    });
+                    addresses.set(key,out);index.set(out,{id,kind});
+                }
+                row[1]=out;
+            }
+        }
+        const readBlock=async id=>{
+            const item=index.get(id);if(!item)throw Error('档案缺少索引');
+            return item.id===id?original(id):cleanText(await original(item.id),item.kind);
+        };
+        return {...source,body,ids:[...index.keys()].sort(),readBlock};
+    }
+    async function facts(source){
+        const pkg={body:{...source.body,blocks:{}}},fields=new Map();
+        for(const run of pkg.body.runs)for(const db of run.state.dbs)for(const store of db.stores)for(const [key,id] of store.rows){
+            let field;
+            if(db.name==='RPHubDB'&&store.name==='store'){
+                if(key==='rp_hub_characters')field='cards';
+                else if(key==='__rph_deleted_cards'||key==='__rph_restored_cards')field='ids';
+                else if(typeof key==='string'&&key.startsWith('rp_hub_chat_'))field='chat';
+                else if(key==='rp_hub_novel_library')field='novels';
+            }else if(db.name==='RPImageLibrary'&&store.name==='slots')field='slot';
+            if(!field)continue;
+            if(fields.has(id) && fields.get(id)!==field){
+                // One content hash may serve several fields; keep its full value when projections differ.
+                fields.set(id,'shared');pkg.body.blocks[id]=await source.readBlock(id);continue;
+            }
+            fields.set(id,field);
+            pkg.body.blocks[id]=await RPCaptureCache.recipe(id,'fact/'+field,async()=>{
+                const value=decode(JSON.parse(await source.readBlock(id)));
+                let compact=value;
+                if(field==='cards')compact=(value||[]).map(c=>({uuid:c.uuid,name:c.name}));
+                if(field==='chat')compact=Array.isArray(value)?value.map(m=>m?.rphFateTurn?{id:m.id,rphFateTurn:m.rphFateTurn}:null):value;
+                if(field==='novels')compact={books:Array(value?.books?.length||0).fill(null)};
+                if(field==='slot')compact={digest:value.digest};
+                return JSON.stringify(await encode(compact));
+            });
+        }
         return pkg;
     }
     async function capture(){
@@ -62,7 +108,7 @@
     const meaningful=s=>s.cards+s.messages+s.points+s.game+s.novels+s.extra>0;
     const byteHash=async b=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',b)),n=>n.toString(16).padStart(2,'0')).join('');
     async function upload(api,local) {
-        const file=new Blob([JSON.stringify(local.pkg)]), chunks=[];
+        const file=local.file||new Blob([JSON.stringify(local.pkg)]), chunks=[];
         for(let start=0;start<file.size;start+=chunkSize){
             const slice=file.slice(start,start+chunkSize);
             chunks.push({hash:await byteHash(await slice.arrayBuffer()),bytes:slice.size});
@@ -84,7 +130,7 @@
         for(const chunk of manifest.chunks){
             const bytes=await (await api('/chunks/'+chunk.hash,{raw:true})).arrayBuffer();
             if(bytes.byteLength!==chunk.bytes || await byteHash(bytes)!==chunk.hash)throw Error('云端分块校验失败');
-            parts.push(bytes);
+            parts.push(new Blob([bytes]));
         }
         const pkg=await archive.readPackage(new Blob(parts));
         if(pkg.digest!==digest)throw Error('云端档案与所选版本不符');
@@ -147,12 +193,17 @@
             const s=db.transaction('store').objectStore('store');
             const values=await Promise.all(candidates.map(([k])=>request(s.get(k))));
             for(const [i,row] of candidates.entries())if(values[i]){
-                const merged=overlay(decode(JSON.parse(pkg.body.blocks[row[1]])),values[i]);
+                const merged=overlay(decode(JSON.parse(pkg.body.blocks[row[1]]??await pkg.readBlock(row[1]))),values[i]);
                 const text=JSON.stringify(await encode(merged)),id=await hash(text);
                 pkg.body.blocks[id]=text;row[1]=id;
             }
         }finally{db.close();}
         return pkg;
     }
-    window.RPFirstConnection={capture,meaningful,migrate,forTransfer,retainDeviceSettings,pending:key=>pending(key,'get')};
+    async function preview(){
+        const plan=await RPArchiveStream.prepare(RPLocalScope.id);
+        const summary=describe(await facts(plan.source));
+        return {pkg:{digest:plan.digest},file:await RPArchiveStream.fileOf(plan.lines()),summary};
+    }
+    window.RPFirstConnection={capture,preview,meaningful,migrate,forTransfer,transferSource,facts,describe,retainDeviceSettings,pending:key=>pending(key,'get')};
 })();

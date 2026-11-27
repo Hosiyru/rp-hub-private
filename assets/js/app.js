@@ -260,7 +260,8 @@ const app = createApp({
             });
         };
 
-        const currentView = ref('chat');
+        const currentView = ref(location.hash === '#gallery' ? 'gallery' : 'chat');
+        if (location.hash === '#gallery') history.replaceState(null, '', location.pathname + location.search);
         const isNavigationOpen = ref(false);
         const showDescriptionPanel = ref(false);
         const showModelSelector = ref(false);
@@ -1998,6 +1999,7 @@ const app = createApp({
             try{
                 const result=await RPImages.resolve(context,plan,(chosen,fresh)=>RPImageProviders.generate(chosen,prompt,fresh,settings.imageGenKey.trim(),show),{redraw});
                 if(!card.isConnected || row.dataset.messageId!==message.id)return;
+                if(!result.blob && result.record.status==='removed')throw Error('原图已删除，可点击重绘');
                 if(!result.blob)throw Error(result.record.status==='pending'?'原图尚未就绪，确认原设备已同步后再打开，或单独重绘':'原图缺失，可在图库补回或单独重绘');
                 forgetImage(card);const url=URL.createObjectURL(result.blob);imageUrls.set(card,url);
                 img.src=url;img.alt=prompt;card.dataset.imageDigest=result.record.digest;
@@ -2021,6 +2023,18 @@ const app = createApp({
                     show(e.message);if(redraw)showToast(e.message,'warning');
                 }
             }finally{cardsLoading.delete(card);activeImageWrites--;if(button)button.disabled=false;}
+        }
+        function refreshGalleryImage(slot){
+            for(const card of chatContainer.value?.querySelectorAll(imageSelector)||[]){
+                const row=card.closest('[data-chat-index]');
+                if(!(slot.digest && card.dataset.imageDigest===slot.digest) &&
+                    !(getCurrentStoryBranchScopeId()===slot.story && row?.dataset.messageId===slot.message &&
+                      [...row.querySelectorAll(imageSelector)].indexOf(card)===slot.index))continue;
+                forgetImage(card);delete card.dataset.imageDigest;
+                const open=card.querySelector('.generated-image-open'),img=card.querySelector('img');
+                if(img){img.removeAttribute('src');if(open)open.replaceWith(img);}
+                card.classList.remove('is-generation-error');void loadGeneratedImageCard(card);
+            }
         }
         function hydrateGeneratedImages(root){
             if(!root)return;
@@ -3505,8 +3519,9 @@ const app = createApp({
         };
 
         const openLocalArchives = async (page) => {
-            const destination = page === 'private.html' ? page : page==='gallery'?'local.html#gallery':'local.html';
+            const destination = page === 'private.html' ? page : 'local.html';
             if (isConversationBusy.value) return showToast('请等待当前回复结束后再管理存档', 'info');
+            if (page === 'gallery') { currentView.value = 'gallery'; return; }
             try {
                 if (!_initComplete) { location.assign(destination); return; }
                 await saveData({propagate:true});
@@ -7893,8 +7908,8 @@ const app = createApp({
                     restoringStartupStory = false;
                 }
             } else if (characters.value.length > 0) {
-                // Fallback to first character if no last active
-                selectCharacter(0);
+                // Initialize the first card without closing a directly opened gallery.
+                selectCharacter(0, false, { silent: currentView.value === 'gallery' });
             }
 
             // Persist the chosen character's presets after its templates are active.
@@ -8212,7 +8227,7 @@ const app = createApp({
                 });
             },
             toggleNavigation, closeNavigation,
-            fetchModels, selectModel, selectQuickModels, openLocalArchives, sendMessage, autoResizeInput, handleChatInputFocus, handleChatInputBlur, stopGeneration, clearChat, toggleChatFullscreen,
+            fetchModels, selectModel, selectQuickModels, openLocalArchives, refreshGalleryImage, sendMessage, autoResizeInput, handleChatInputFocus, handleChatInputBlur, stopGeneration, clearChat, toggleChatFullscreen,
             handleConfirm, handleCancel, // Export handlers
             copyMessage, playMessageActionFeedback, canDeleteMessage, deleteMessage, regenerateMessage,
             editMessage, saveEditMessage, cancelEditMessage,

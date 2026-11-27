@@ -1,6 +1,8 @@
+import {cleanup} from './cleanup.mjs';
 import {generationRoute,consumeGeneration,recoverGeneration} from './generation.mjs';
 import {updateRoute,installed} from './updates.mjs';
 import {syncRoute} from './sync.mjs';
+import {galleryRoute} from './gallery.mjs';
 const APK = 'https://rphub.local';
 const PREFIX = '/api/private/v1';
 const HEX = /^[a-f0-9]{64}$/;
@@ -100,6 +102,7 @@ async function handle(req,env,ctx) {
     const expectedAccount=req.headers.get('X-RP-Account');
     if(expectedAccount && expectedAccount!==a.id)problem(409,'当前登录账号已变化，请返回私人站点核对');
     if(path==='/me' && method==='GET')return json(a);
+    if(path.startsWith('/storage/'))return galleryRoute({account:a.id,db,bucket:env.ARCHIVES,path,method,req,readJson});
     if(path==='/updates'||path==='/updates/latest')return updateRoute({env,req,path,role:a.role,readJson,ctx});
     if(path==='/jobs'||path.startsWith('/jobs/'))return generationRoute({env,account:a.id,req,path,method,readJson,sha});
     if(path==='/sync'||path.startsWith('/sync/'))return syncRoute({db,account:a.id,path,method,req,readJson,sha});
@@ -119,10 +122,10 @@ async function handle(req,env,ctx) {
         return json(rows.results.map(r=>({...r,summary:JSON.parse(r.summary)})));
     }
     if(path==='/missing' && method==='POST'){
-        const {hashes}=await readJson(req,12000);
+        const {hashes,imageCleanup}=await readJson(req,12000);
         if(!Array.isArray(hashes)||hashes.length>128||hashes.some(h=>!HEX.test(h)))problem(400,'分块列表无效');
-        const rows=await db.prepare('SELECT DISTINCT j.value AS hash FROM json_each(?) j LEFT JOIN chunks c ON c.account=? AND c.hash=j.value WHERE c.hash IS NULL')
-            .bind(JSON.stringify(hashes),a.id).all();
+        const rows=await db.prepare('SELECT DISTINCT j.value AS hash FROM json_each(?) j LEFT JOIN chunks c ON c.account=? AND c.hash=j.value WHERE c.hash IS NULL OR c.pending_delete=1 OR (?=1 AND c.bytes=0)')
+            .bind(JSON.stringify(hashes),a.id,imageCleanup===1?1:0).all();
         return json(rows.results.map(r=>r.hash));
     }
     if(path.startsWith('/chunks/') && HEX.test(path.slice(8))){
@@ -130,8 +133,18 @@ async function handle(req,env,ctx) {
         if(method==='PUT'){
             const bytes=await readBytes(req,CHUNK);
             if(!bytes.length || await sha(bytes)!==hash)problem(422,'分块摘要校验失败');
+            const stored=await db.prepare('SELECT bytes,pending_delete FROM chunks WHERE account=? AND hash=?').bind(a.id,hash).first();
+            if(stored?.pending_delete)throw Object.assign(Error('云端正在整理，请稍后重试'),{status:503,code:'GC_BUSY'});
+            if(stored?.bytes>0)return json({ok:true});
+            if(stored && (stored.bytes<0 || url.searchParams.get('imageCleanup')!=='1'))problem(409,'原图已移除，请刷新图库');
+            // Ordinary archive chunks are UTF-8; 0xff identifies binary image chunks, including shared originals.
+            const image=bytes[0]===255 && bytes.length>33?Array.from(bytes.subarray(1,33),v=>v.toString(16).padStart(2,'0')).join(''):null;
+            if(image){
+                const removed=await db.prepare('SELECT token FROM removed_images WHERE account=? AND digest=?').bind(a.id,image).first();
+                if(removed && removed.token!==url.searchParams.get('redraw'))problem(409,'这张原图已删除，请刷新后同步');
+            }
             await env.ARCHIVES.put(key,bytes,{sha256:Uint8Array.from(hash.match(/../g),v=>parseInt(v,16)).buffer});
-            await db.prepare('INSERT OR IGNORE INTO chunks VALUES(?,?,?)').bind(a.id,hash,bytes.length).run();
+            await db.prepare('INSERT INTO chunks(account,hash,bytes,image,created) VALUES(?,?,?,?,unixepoch()) ON CONFLICT(account,hash) DO UPDATE SET bytes=excluded.bytes,image=excluded.image,created=excluded.created WHERE chunks.bytes=0 AND chunks.pending_delete=0').bind(a.id,hash,bytes.length,image).run();
             return json({ok:true});
         }
         if(method==='GET'){
@@ -155,7 +168,7 @@ async function handle(req,env,ctx) {
         const result=await db.prepare(
             "INSERT OR IGNORE INTO archives SELECT ?,?,?,? WHERE NOT EXISTS ("+
             "SELECT 1 FROM json_each(?) p LEFT JOIN chunks c ON c.account=? AND c.hash=json_extract(p.value,'$.hash') "+
-            "AND c.bytes=json_extract(p.value,'$.bytes') WHERE c.hash IS NULL)"
+            "AND c.pending_delete=0 AND c.bytes=json_extract(p.value,'$.bytes') WHERE c.hash IS NULL)"
         ).bind(a.id,m.digest,manifest,now(),JSON.stringify(m.chunks),a.id).run();
         if(!result.meta.changes){
             const stored=await db.prepare('SELECT manifest FROM archives WHERE account=? AND digest=?').bind(a.id,m.digest).first();
@@ -185,15 +198,15 @@ export default {
         if(!url.pathname.startsWith(PREFIX+'/'))return env.ASSETS.fetch(req);
         let response;
         try{response=await handle(req,env,ctx);}
-        catch(e){response=json({error:e.status?e.message:'站点服务暂不可用，请检查绑定和数据库迁移',official:e.official},e.status||503);}
+        catch(e){response=json({error:e.status?e.message:'站点服务暂不可用，请检查绑定和数据库迁移',code:e.code,official:e.official},e.status||503);}
         const h=response.headers;h.set('Cache-Control','no-store');h.set('Vary','Origin');h.set('X-Content-Type-Options','nosniff');
         if(req.headers.get('Origin')===APK){
             h.set('Access-Control-Allow-Origin',APK);h.set('Access-Control-Allow-Headers','Content-Type,Authorization,X-RP-Site,X-RP-Account');
-            h.set('Access-Control-Allow-Methods','GET,POST,PUT,OPTIONS');
+            h.set('Access-Control-Allow-Methods','GET,POST,PUT,DELETE,OPTIONS');
         }
         return response;
     },
-    async scheduled(_event,env){await recoverGeneration(env);},
+    async scheduled(_event,env){await recoverGeneration(env);await cleanup(env);},
     async queue(batch,env){
         for(const msg of batch.messages){
             if(msg.body?.type==='binding-check')await env.DB.prepare('UPDATE probes SET consumed=1 WHERE id=?').bind(msg.body.id).run();

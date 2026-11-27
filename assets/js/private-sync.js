@@ -40,15 +40,39 @@
         return {s,key,check,call:(path,options)=>{check();return api.request(s,path,options);}};
     }
     const localKey=(c,id)=>c.key+'/'+id, partKey=(c,id)=>c.key+'/'+id;
-    async function capture(){
+    // IDB clones a typed array's entire backing buffer, even for a small view.
+    const exactPart=bytes=>bytes.byteLength===bytes.buffer.byteLength?bytes:bytes.slice();
+    async function pieceStore(c){
+        const prefix=c.key+'/',keys=await store('parts',s=>s.getAllKeys(IDBKeyRange.bound(prefix,prefix+'\uffff')));
+        const known=new Set(keys.map(k=>k.slice(prefix.length)));
+        return {
+            has:ids=>ids.every(id=>known.has(id)),
+            async write(group){
+                c.check();await store('parts',s=>{for(const [id,value] of group)if(!known.has(id))s.put(exactPart(value),partKey(c,id));},true);
+                for(const id of group.keys())known.add(id);
+            }
+        };
+    }
+    async function capture(c){
         for(let attempt=0;;attempt++){
+            const removed=JSON.stringify(await RPImageRemovals.refresh());
             try{
-                const stamp=revision(), here=await RPFirstConnection.capture();
-                const packed=await RPSyncFormat.pack(here);
+                const stamp=revision(),source=await RPFirstConnection.transferSource(await RPCaptureCache.collect(scope.id));
+                const pkg=await RPFirstConnection.facts(source),summary=RPFirstConnection.describe(pkg);
+                const packed=await RPSyncFormat.pack({pkg,summary,source},RPImageRemovals.managed(),await pieceStore(c));
                 if(stamp!==revision())throw Object.assign(Error('进度正在写入，稍后重试'),{code:'SAVE_CHANGED'});
-                return {...packed,stamp,meaningful:RPFirstConnection.meaningful(here.summary)};
+                return {...packed,stamp,removals:removed,meaningful:RPFirstConnection.meaningful(summary)};
             }catch(e){
-                if(e.code!=='SAVE_CHANGED' || attempt>=3)throw e;
+                if(e.code!=='SAVE_CHANGED'){
+                    const stamp=revision();
+                    console.warn('增量捕获失败，重新从本机读取完整存档',e.message);
+                    const key='__rph_capture_stats',stats=JSON.parse(disk.getItem(key)||'{}');
+                    stats.fallback=(stats.fallback||0)+1;disk.setItem(key,JSON.stringify(stats));RPCaptureCache.reset();
+                    const full=await RPFirstConnection.capture(),packed=await RPSyncFormat.pack(full,RPImageRemovals.managed());
+                    if(stamp!==revision())throw Error('完整核对时进度已变化，请重试');
+                    return {...packed,stamp,removals:removed,meaningful:RPFirstConnection.meaningful(full.summary)};
+                }
+                if(attempt>=3)throw e;
                 await new Promise(ok=>setTimeout(ok,250*(attempt+1)));
             }
         }
@@ -72,20 +96,55 @@
     async function heads(c){
         const rows=await c.call('/sync');c.check();remoteHeads=rows;return rows;
     }
+    let confirmations;
+    async function confirmed(slot,value){
+        if(!confirmations)confirmations=new Promise((ok,no)=>{
+            const q=scope.factory.open('__rph_confirmed_parts',1);q.onupgradeneeded=()=>q.result.createObjectStore('bases');
+            q.onsuccess=()=>ok(q.result);q.onerror=()=>no(q.error);
+        });
+        const tx=(await confirmations).transaction('bases',value?'readwrite':'readonly'),s=tx.objectStore('bases');
+        const q=value?s.put(value,slot):s.get(slot);
+        return new Promise((ok,no)=>{tx.oncomplete=()=>ok(q.result);tx.onabort=()=>no(tx.error);});
+    }
+    async function prune(c){
+        const account=c.key+'/',range=IDBKeyRange.bound(account,account+'\uffff');
+        const live=new Set((await archive.runs()).map(r=>account+r.id)),parts=new Set();
+        const db=await confirmations,tx=db.transaction('bases','readwrite');
+        const cursor=tx.objectStore('bases').openCursor(range);
+        cursor.onsuccess=()=>{const row=cursor.result;if(!row)return;
+            if(live.has(row.key))for(const id of row.value.parts)parts.add(id);
+            else row.delete();row.continue();
+        };
+        await new Promise((ok,no)=>{tx.oncomplete=ok;tx.onabort=()=>no(tx.error);});
+        const sweep=(await cache()).transaction(['outbox','parts'],'readwrite');
+        const out=sweep.objectStore('outbox').getAll(range),pieces=sweep.objectStore('parts');
+        out.onsuccess=()=>{
+            for(const job of out.result)for(const id of job.manifest.parts)parts.add(id);
+            const q=pieces.openKeyCursor(range);
+            q.onsuccess=()=>{const row=q.result;if(!row)return;
+                if(!parts.has(row.key.slice(account.length)))pieces.delete(row.key);
+                row.continue();
+            };
+        };
+        await new Promise((ok,no)=>{sweep.oncomplete=ok;sweep.onabort=()=>no(sweep.error);});
+    }
     async function push(c,first,staged,finalize) {
         const slot=localKey(c,scope.id), b=base(c.s);
+        const removals=JSON.stringify(await RPImageRemovals.refresh(true));
+        if(staged && staged.removals!==removals)staged=null;
         let work=await store('outbox',s=>s.get(slot));
+        if(work && (work.removals||'{}')!==removals){await store('outbox',s=>s.delete(slot),true);work=null;staged=null;}
         if(!work){
             if(b && b.stamp===revision() && !staged)return b;
-            const data=staged||await capture();
+            const data=staged||await capture(c);
             if(b && data.manifest.root===b.root){
                 b.stamp=data.stamp;setBase(c.s,scope.id,b);return b;
             }
             if(!data.meaningful && !b)return null;
             if(first && !b && remoteHeads.length && !disk.getItem(prefix(c.s)+'allow/'+scope.id))
                 throw Error('两端均有进度。请先在私人站点选择上传本机另存分支，或拉取云档另开进度。');
-            const manifest={...data.manifest,...(b?.recoveryVersion?{recoveryVersion:1}:{}),parent:b?.id||null,branch:b?.branch||'main'};
-            work={manifest,stamp:data.stamp};
+            const manifest={...data.manifest,...(b?.galleryVersion?{galleryVersion:1}:{}),...(b?.recoveryVersion?{recoveryVersion:1}:{}),parent:b?.id||null,branch:b?.branch||'main'};
+            work={manifest,stamp:data.stamp,removals};
             c.check();
             const db=await cache();
             await new Promise((ok,no)=>{
@@ -93,13 +152,13 @@
                 const parts=tx.objectStore('parts');
                 for(const [id,value] of data.pieces){
                     const key=partKey(c,id), found=parts.getKey(key);
-                    found.onsuccess=()=>{if(found.result===undefined)parts.put(value,key);};
+                    found.onsuccess=()=>{if(found.result===undefined)parts.put(exactPart(value),key);};
                 }
                 tx.objectStore('outbox').put(work,slot);
                 tx.oncomplete=ok;tx.onabort=()=>no(tx.error);
             });
         }
-        const m=work.manifest;
+        const m=work.manifest,removed=JSON.parse(work.removals||'{}');
         if((m.turns?.length && c.s.gameVersion!==1)||(m.imageVersion && c.s.imageVersion!==1)||(m.recoveryVersion && c.s.recoveryVersion!==1)){
             const info=await c.call('/site');
             if(m.recoveryVersion && info.recoveryVersion!==1)throw Error('请先更新私人站点再同步单卡回收记录；本机删除副本和原云档均已保留');
@@ -107,22 +166,46 @@
             const capabilities={gameVersion:info.gameVersion||0,imageVersion:info.imageVersion||0,recoveryVersion:info.recoveryVersion||0};
             c.check();Object.assign(c.s,capabilities);api.save({...api.session(),...capabilities});
         }
-        for(let i=0;i<m.parts.length;i+=128){
-            const missing=await c.call('/missing',{method:'POST',json:{hashes:m.parts.slice(i,i+128)}});
+        const prior=await confirmed(slot),skip=new Set(prior?.id===m.parent?prior.parts:[]);
+        let rebuilt=false;
+        async function upload(ids){
+          for(let i=0;i<ids.length;i+=128){
+            const missing=await c.call('/missing',{method:'POST',json:{hashes:ids.slice(i,i+128),imageCleanup:1}});
             for(const id of missing){
-                const bytes=await store('parts',s=>s.get(partKey(c,id)));
+                let bytes=await store('parts',s=>s.get(partKey(c,id)));
+                if(!bytes && !rebuilt){
+                    rebuilt=true;RPCaptureCache.reset();
+                    const data=await capture(c),sink=await pieceStore(c);await sink.write(data.pieces);
+                    bytes=await store('parts',s=>s.get(partKey(c,id)));
+                }
                 if(!bytes)throw Error('待传内容缺失，请检查本机文件副本');
-                await c.call('/chunks/'+id,{method:'PUT',body:bytes});
+                let query='?imageCleanup=1';
+                if(bytes[0]===255){
+                    const digest=Array.from(bytes.subarray(1,33),v=>v.toString(16).padStart(2,'0')).join('');
+                    if(removed[digest])query+='&redraw='+encodeURIComponent(removed[digest]);
+                }
+                await c.call('/chunks/'+id+query,{method:'PUT',body:bytes});
             }
         }
-        const result=finalize?await finalize(m):await c.call('/sync',{method:'POST',json:m});
+        }
+        const commit=()=>finalize?finalize(m):c.call('/sync',{method:'POST',json:m});
+        await upload(m.parts.filter(id=>!skip.has(id)));
+        let result;
+        try{result=await commit();}
+        catch(e){
+            if(e.code!=='MISSING_CHUNKS' && !(e.status===409 && e.message.includes('未确认的分块')))throw e;
+            await upload(m.parts);result=await commit();
+        }
+        await confirmed(slot,{id:result.id,parts:m.parts});
         c.check();
-        const next={...result,recoveryVersion:m.recoveryVersion,root:m.root,stamp:work.stamp,receipt:gameStatus(m.turns)};
+        const next={...result,galleryVersion:m.galleryVersion,recoveryVersion:m.recoveryVersion,root:m.root,stamp:work.stamp,receipt:gameStatus(m.turns)};
         setBase(c.s,scope.id,next);
         await store('outbox',s=>s.delete(slot),true);
+        await prune(c);
         return next;
     }
     async function remoteSource(c,head){
+        await RPImageRemovals.refresh(true);
         const m=await c.call('/sync/'+head.id);
         if(await archive.codec.hash(JSON.stringify(m))!==head.id)throw Error('云端修订校验失败，已保留本机进度');
         const read=async id=>{
@@ -157,9 +240,11 @@
     async function pull(c,head,automatic=false,official=false) {
         if(!head)return false;
         const b=base(c.s);
+        if(head.id===b?.id && !official)await RPImageRemovals.refresh(true);
         if(head.id===b?.id && !official)return false;
         const stamp=revision(),{m,read}=await remoteSource(c,head);
-        const pkg=await RPSyncFormat.unpack(m,read);
+        const {meta,readBlock}=await RPSyncFormat.openBackup(m,read);
+        const pkg={body:{version:1,active:'main',runs:[{id:'main',name:m.label,state:meta.state,points:meta.points}],blocks:{}},readBlock};
         c.check();
         // Imports are staged outside the live namespace. Even a partial multi-database restore cannot overwrite it.
         const old=(await archive.runs()).find(r=>r.id===scope.id);
@@ -172,7 +257,9 @@
         if(existing && existing.stamp!==revision(id))throw Error('这份云档已在本机继续游玩，可从本机进度打开');
         if(stamp!==revision()||window.RPGameBusy?.())throw Error('本机正在游玩，云档已下载，空闲后可继续');
         c.check();
-        setBase(c.s,id,{id:head.id,branch:head.branch,recoveryVersion:m.recoveryVersion,root:m.root,stamp:revision(id),receipt:gameStatus(m.turns)});
+        await confirmed(localKey(c,id),{id:head.id,parts:m.parts});
+        setBase(c.s,id,{id:head.id,branch:head.branch,galleryVersion:m.galleryVersion,recoveryVersion:m.recoveryVersion,root:m.root,stamp:revision(id),receipt:gameStatus(m.turns)});
+        await prune(c);
         await archive.activate(id);
         if(rotate)disk.setItem('__rph_sync_retire/'+id,JSON.stringify({old:scope.id,next:id,stamp,key:c.key}));
         status('云端已确认，正在打开进度');
@@ -200,14 +287,16 @@
                         if(window.RPGenerationActive?.() || (window.RPGameBusy?.() && head && head.id!==b?.id)){status('本机正在游玩，稍后接续');schedule(2500);return;}
                         const queued=await store('outbox',s=>s.get(localKey(c,scope.id)));
                         if(queued || !b || b.stamp!==revision()){
-                            const data=queued?null:await capture();
+                            const data=queued?null:await capture(c);
                             if(!b && head && data && !data.meaningful){if(await pull(c,head,true))return;}
                             const saved=await push(c,true,data);
-                            // A local change kept its own branch if another writer advanced the same parent.
-                            if(saved && saved.id!==b?.id){await heads(c);
-                                if(b && saved.branch!==b.branch){
-                                    const advanced=remoteHeads.find(h=>h.branch===b.branch);
-                                    if(advanced && !window.RPGameBusy?.() && await pull(c,advanced))return;
+                            if(saved && saved.id!==b?.id){
+                                const tips=await heads(c);
+                                // An idempotent commit can return a historical revision on the same branch.
+                                const advanced=tips.find(h=>h.branch===(b?.branch||saved.branch));
+                                if(advanced && advanced.id!==saved.id){
+                                    if(window.RPGameBusy?.()){status('本机正在游玩，稍后接续');schedule(2500);return;}
+                                    if(await pull(c,advanced))return;
                                 }
                                 if(saved.stamp===revision())status(saved.receipt||'云端已确认');else{status('本机已保存 · 待同步');schedule(200);}
                                 retry=1500;return;}
@@ -238,7 +327,7 @@
                 job=await c.call('/jobs',{method:'POST',json:{...input,...ref},signal});
                 return job.commit;
             };
-            const data=await capture();
+            const data=await capture(c);
             const saved=await push(c,true,data,manifest=>post({manifest}));
             if(!job){if(!saved)throw Error('请先保存当前对话');await post({revision:saved.id});}
             status('生成任务已由私人站点接收');return job.id;

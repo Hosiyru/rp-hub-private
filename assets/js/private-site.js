@@ -190,7 +190,7 @@
     }
     $('preview').onclick=perform(async()=>{
         preview=null;show('comparison',false);
-        const [here,cloud]=await Promise.all([transfer.capture(),api('/archives')]);
+        const [here,cloud]=await Promise.all([transfer.preview(),api('/archives')]);
         $('localSummary').textContent=describe(here.summary);
         const list=$('cloudList');list.replaceChildren();if(!cloud.length)list.textContent='此账号尚无云档';
         for(const r of cloud){

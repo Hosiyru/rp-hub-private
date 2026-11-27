@@ -28,16 +28,17 @@
         const rows=tx.objectStore('slots').getAll();
         rows.onsuccess=()=>{if(!rows.result.some(s=>s.digest===digest))tx.objectStore('originals').delete(digest);};
     }
-    async function commit(slot,blob,expected){
+    async function commit(slot,blob,expected,redraw=false){
         if(!raster(blob))throw Error('未取得有效的原图文件');
         const digest=await RPSyncFormat.digest(new Uint8Array(await blob.arrayBuffer()));
         if(expected && digest!==expected)throw Error('文件与原图摘要不同，原记录已保留');
-        const record={...slot,digest,type:blob.type,bytes:blob.size,status:'ready'};
+        const record={...slot,digest,type:blob.type,bytes:blob.size,status:'ready',afterRemoval:redraw?RPImageRemovals.known()[digest]||null:null};
         const tx=(await database()).transaction(['originals','slots'],'readwrite'),images=tx.objectStore('originals');
         const exists=images.getKey(digest);exists.onsuccess=()=>{if(exists.result===undefined)images.add(blob,digest);};
         tx.objectStore('slots').put(record,key(slot));
         if(slot.digest && slot.digest!==digest)removeUnusedOriginal(tx,slot.digest);
         await finish(tx);
+        window.RPImageThumbs?.schedule(digest);
         return {record,blob};
     }
     function legacySource(old,s){
@@ -65,7 +66,9 @@
         if(plan)plan={provider:String(plan.provider||'jobs'),style:String(plan.style||''),params:params(plan.params),
             ...(plan.provider==='compatible'?{endpoint:RPImageProviders.endpoint(plan.endpoint),model:String(plan.model||'')}:{})};
         return navigator.locks.request('rph-image/'+RPLocalScope.id+'/'+key(s),async()=>{
+            const removed=await RPImageRemovals.refresh().catch(()=>RPImageRemovals.known());
             let slot=await get('slots',key(s));
+            if(slot)slot=RPImageRemovals.slot(slot,removed);
             if(slot?.digest && !redraw && !original)return {record:slot,blob:await get('originals',slot.digest)};
             if(!slot){
                 const prior=await legacy(s);
@@ -74,17 +77,19 @@
                 await putSlot(slot);
                 if(!redraw && !original && slot.status==='missing')return {record:slot};
             }else if(!redraw && !original)return {record:slot};
+            if(original && slot.status==='removed')throw Error('这张原图已删除，可在聊天中重绘');
             if(original)return commit(slot,original,slot.digest||slot.previousDigest);
             // A failed redraw cannot replace the old reference. Interrupted first attempts require an explicit retry.
             let chosen=redraw?plan:slot.plan;
             if(chosen){const params={...chosen.params,tag:s.prompt};if(redraw){params.nocache='1';params.seed=String(crypto.getRandomValues(new Uint32Array(1))[0]);}chosen={...chosen,params};}
             if(!chosen)return {record:slot};
-            return commit({...slot,plan:chosen},await generate(chosen,redraw));
+            return commit({...slot,plan:chosen},await generate(chosen,redraw),undefined,redraw);
         });
     }
     async function list(){if(!(await factory.databases()).some(d=>d.name==='RPImageLibrary'))return [];return pending((await database()).transaction('slots').objectStore('slots').getAll());}
     async function catalog(){
-        const rows=await list(),known=new Set(rows.map(key)),prefix='rp_hub_image_renders_';
+        const removed=await RPImageRemovals.refresh().catch(()=>RPImageRemovals.known());
+        const rows=(await list()).map(s=>RPImageRemovals.slot(s,removed)),known=new Set(rows.map(key)),prefix='rp_hub_image_renders_';
         if(!(await factory.databases()).some(d=>d.name==='RPHubDB'))return rows;
         const db=await pending(factory.open('RPHubDB'));
         try{
@@ -108,6 +113,38 @@
             return rows;
         }finally{db.close();}
     }
+    const keepKey='rph_image_keep';
+    const kept=()=>JSON.parse(localStorage.getItem(keepKey)||'{}');
+    async function setKept(digests,value){
+        const ids=new Set(digests);
+        if([...ids].some(id=>!/^[a-f0-9]{64}$/.test(id)))throw Error('原图摘要无效');
+        return navigator.locks.request('rph-image-stars/'+RPLocalScope.id,()=>{
+            const marks=kept(),now=Date.now();let changed=false;
+            for(const id of ids){
+                if(Object.hasOwn(marks,id)===value)continue;
+                if(value)marks[id]=now;else delete marks[id];
+                changed=true;
+            }
+            if(changed)localStorage.setItem(keepKey,JSON.stringify(marks));
+            return marks;
+        });
+    }
+    async function gallery(){
+        const byDigest=new Map(),entries=[],marks=kept();
+        for(const slot of await catalog()){
+            let item=slot.digest && byDigest.get(slot.digest);
+            if(!item){
+                item={digest:slot.digest||null,bytes:slot.bytes||0,created:slot.created||0,
+                    owners:new Map(),uses:[],keep:!!marks[slot.digest]};
+                entries.push(item);
+                if(slot.digest)byDigest.set(slot.digest,item);
+            }
+            item.uses.push(slot);
+            item.owners.set(slot.owner,slot.name||slot.owner||'未命名角色');
+            item.created=Math.min(item.created,slot.created||0);
+        }
+        return entries.sort((a,b)=>b.created-a.created);
+    }
     async function fork(source,dest,messages){
         if(!(await factory.databases()).some(d=>d.name==='RPImageLibrary'))return;
         const ids=new Set(messages.map(m=>m?.id)),rows=(await list()).filter(s=>s.story===source && ids.has(s.message));
@@ -118,12 +155,16 @@
     }
     async function remove(s){
         return navigator.locks.request('rph-image/'+RPLocalScope.id+'/'+key(s),async()=>{
-            const db=await database(),tx=db.transaction(['slots','originals'],'readwrite'),slots=tx.objectStore('slots');
-            const read=slots.get(key(s));read.onsuccess=()=>{
-                const current=read.result;if(!current?.digest || current.digest!==s.digest)return;
-                slots.put({...current,previousDigest:current.digest,digest:null,bytes:0,status:'removed'},key(s));
+            const current=await get('slots',key(s)),blob=await get('originals',s.digest);
+            if(!blob||current?.digest!==s.digest)throw Error('这张原图已变更，请刷新图库');
+            await RPImageRemovals.remove(current,blob);
+            const removed=RPImageRemovals.known(),db=await database();
+            const tx=db.transaction(['slots','originals'],'readwrite'),slots=tx.objectStore('slots');
+            const all=slots.getAll();all.onsuccess=()=>{
+                for(const item of all.result)if(item.digest===s.digest)slots.put(RPImageRemovals.slot(item,removed),key(item));
                 removeUnusedOriginal(tx,s.digest);
             };await finish(tx);
+            await setKept([s.digest],false);
         });
     }
     async function retireOwners(ids){
@@ -138,5 +179,5 @@
         for(const digest of removed)if(!retained.has(digest))tx.objectStore('originals').delete(digest);
         await finished;
     }
-    window.RPImages={retireOwners,resolve,list,catalog,fork,params,remove,device,getOriginal:d=>get('originals',d),raster};
+    window.RPImages={retireOwners,resolve,list,catalog,gallery,setKept,fork,params,remove,device,getOriginal:d=>get('originals',d),raster};
 })();

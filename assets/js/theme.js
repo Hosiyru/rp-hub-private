@@ -6,7 +6,7 @@
     const localFrame = frame => {
         if (!frame.src) return false;
         const url = new URL(frame.src, location.href);
-        return url.origin === location.origin && /\/(character|novel)\/index\.html$/.test(url.pathname);
+        return url.origin === location.origin && /\/(?:gallery\.html|(?:character|novel)\/index\.html)$/.test(url.pathname);
     };
     const send = frame => {
         if (!localFrame(frame)) return;

@@ -6,7 +6,7 @@ const dist = path.join(root,'dist');
 await mkdir(dist,{recursive:true});
 const stage = await mkdtemp(path.join(dist,'site-build-'));
 try {
-    for (const name of ['assets','character','novel','index.html','local.html','private.html','deploy.html','offline.js','LICENSE'])
+    for (const name of ['assets','character','novel','index.html','gallery.html','local.html','private.html','deploy.html','offline.js','LICENSE'])
         await cp(path.join(root,name),path.join(stage,name),{recursive:true});
     const dest = path.join(dist,'site');
     await rm(dest,{recursive:true,force:true});

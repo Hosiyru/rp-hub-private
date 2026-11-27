@@ -78,7 +78,7 @@ export async function generationRoute({env,account,req,path,method,readJson,sha}
         await env.ARCHIVES.put(object,ciphertext);
         if(commit)ops.push(commit.insert);
         ops.push(db.prepare(`INSERT OR IGNORE INTO generation_jobs(account,id,revision,story,message,fingerprint,reply_tool,payload)
-            SELECT ?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM sync_revisions WHERE account=? AND id=?)`)
+            SELECT ?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM sync_revisions WHERE account=? AND id=? AND manifest->>\'$.tombstone\' IS NULL)`)
             .bind(account,id,revision,story,message,fingerprint,body.tools?.some(t=>t.function?.name==='output_reply')?1:0,object,account,revision));
         let inserted;
         try{inserted=(await db.batch(ops)).at(-1);}catch(e){await env.ARCHIVES.delete(object);throw e;}

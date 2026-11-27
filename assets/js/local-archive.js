@@ -27,7 +27,10 @@
         if (typeof value === 'number' && !Number.isFinite(value)) return ['number',String(value)];
         if (value === null || ['string','number','boolean'].includes(typeof value)) return value;
         if (value instanceof Date) return ['date',value.toISOString()];
-        if (value instanceof Blob) return ['blob',value.type,base64(new Uint8Array(await value.arrayBuffer()))];
+        if (value instanceof Blob) {
+            const url=await new Promise((ok,no)=>{const r=new FileReader();r.onload=()=>ok(r.result);r.onerror=()=>no(r.error);r.readAsDataURL(value);});
+            return ['blob',value.type,url.slice(url.indexOf(',')+1)];
+        }
         if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
             const bytes = value instanceof ArrayBuffer ? new Uint8Array(value) : new Uint8Array(value.buffer,value.byteOffset,value.byteLength);
             return ['binary',value.constructor.name,base64(bytes)];
@@ -36,6 +39,7 @@
         if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) throw Error('档案含未支持的数据类型');
         return ['object',await Promise.all(Object.entries(value).map(async ([k,v]) => [k,await encode(v)]))];
     }
+    const unbase64=text=>typeof Uint8Array.fromBase64==='function'?Uint8Array.fromBase64(text):Uint8Array.from(atob(text),c=>c.charCodeAt(0));
     function decode(value) {
         if (!Array.isArray(value)) return value;
         const [type,a,b] = value;
@@ -45,7 +49,7 @@
             case 'date': return new Date(a);
             case 'array': return a.map(decode);
             case 'object': return Object.fromEntries(a.map(([k,v]) => [k,decode(v)]));
-            case 'blob': return new Blob([Uint8Array.from(atob(b), c => c.charCodeAt(0))],{type:a});
+            case 'blob': return new Blob([unbase64(b)],{type:a});
             case 'binary': {
                 const buffer = Uint8Array.from(atob(b), c => c.charCodeAt(0)).buffer;
                 if (a === 'ArrayBuffer') return buffer;
@@ -60,7 +64,7 @@
         blocks[id] = str;
         return id;
     }
-    async function snapshot(run, blocks, select) {
+    async function snapshot(run, blocks, select, source) {
         const revisionKey = '__rph_revision_' + run;
         const revision = scope.disk.getItem(revisionKey);
         const dbs = [], storage = [];
@@ -83,6 +87,7 @@
                         const spec = {name:n, keyPath:store.keyPath, autoIncrement:store.autoIncrement,
                             indexes:[...store.indexNames].map(i => {const x=store.index(i); return [i,x.keyPath,x.unique,x.multiEntry];}), rows:[]};
                         stores.push(spec);
+                        if(source){await source.table(run,db,store,spec);return;}
                         const [keys,values] = select ? await select.rows(dbName,store,request) : await Promise.all([request(store.getAllKeys()),request(store.getAll())]);
                         for (let i=0;i<keys.length;i++) {
                             if (logical(run,name)==='RPHubDB' && n==='store' && keys[i]===library.mirror) continue;
@@ -191,7 +196,7 @@
     function activateRecovered({id,stamp}){
         if(scope.disk.getItem('__rph_revision_'+scope.id)!==stamp||sessionStorage.getItem(scope.activeKey)!==scope.id)
             throw Error('当前进度有新写入，已保留原进度，请重新恢复');
-        if(location.origin==='https://rphub.local')scope.disk.setItem('__rph_mirror_after_restore',id);
+        if(window.RPLocalNative?.enabled())scope.disk.setItem('__rph_mirror_after_restore',id);
         sessionStorage.setItem(scope.activeKey,id);scope.disk.setItem(scope.activeKey,id);
     }
     async function portable(onlyRun) {
@@ -208,6 +213,7 @@
             if (blocks[id]===undefined || await hash(blocks[id])!==id) throw Error('存档点引用的数据缺失或损坏，已取消导出');
         }
         const body = {version:1,active:onlyRun||scope.id,runs:entries,blocks};
+        await window.RPImageRemovals?.strip(body);
         return {type:'rp-hub-local',digest:await hash(JSON.stringify(body)),body};
     }
     function validateState(state,blocks) {
@@ -235,6 +241,7 @@
             Object.fromEntries(Object.entries(value).map(([key,v])=>[key,decodeLegacyBinary(v)]));
     }
     async function readPackage(file) {
+        if(file instanceof Blob && window.RPArchiveStream && await RPArchiveStream.isFile(file))return RPArchiveStream.read(file);
         const pkg = JSON.parse(typeof file==='string'?file:await file.text());
         if (pkg.type==='rp-hub-complete-backup' && pkg.version===8) {
             if (!Array.isArray(pkg.entries) || !pkg.entries.length || Object.keys(pkg.databases||{}).length || Object.keys(pkg.webStorage||{}).some(k=>k!=='localStorage')) throw Error('此 APK 包含未支持的附属数据，已停止整包导入');
@@ -268,8 +275,8 @@
             });
             try {
                 // Only the completed namespace becomes visible. Keep decoded rows bounded during large imports.
-                for (const s of d.stores) for(let offset=0;offset<s.rows.length;offset+=16){
-                    const rows=await Promise.all(s.rows.slice(offset,offset+16).map(async ([key,id])=>[decode(key),decode(JSON.parse(await block(id)))]));
+                for (const s of d.stores) for(let offset=0;offset<s.rows.length;offset+=4){
+                    const rows=await Promise.all(s.rows.slice(offset,offset+4).map(async ([key,id])=>[decode(key),decode(JSON.parse(await block(id)))]));
                     const tx=db.transaction(s.name,'readwrite'), completion=done(tx), store=tx.objectStore(s.name);
                     try { for (const [key,value] of rows) s.keyPath===null ? store.add(value,key) : store.add(value); }
                     catch(e) { tx.abort(); await completion.catch(()=>{}); throw e; }
@@ -292,9 +299,16 @@
             const tx=(await meta).transaction('runs','readwrite');
             tx.objectStore('runs').add(run,run.id); await done(tx);
         } catch(e) {await discard(run.id); throw e;}
+        window.RPImageRemovals?.inherit(point.run,run.id);
         return run.id;
     }
-    async function importPackage({body,digest},syncCopy) {
+    async function importPackage({body,digest,readBlock},syncCopy) {
+        const read=async id=>{
+            if(body.blocks && Object.hasOwn(body.blocks,id))return body.blocks[id];
+            const text=await readBlock(id);
+            if(typeof text!=='string'||await hash(text)!==id)throw Error('导入数据块校验失败');
+            return text;
+        };
         return navigator.locks.request('rph-import',async ()=>{
             const previous=await get('imports',digest);
             if (previous) return previous;
@@ -305,17 +319,22 @@
                     const run={id:uid(),name:entry.name+' · 导入',sources:[...new Set([entry.id,...(entry.sources||[])])]};
                     if(syncCopy)run.syncCopy={key:syncCopy.key,digest};
                     staged.push(run);
-                    await materialize(run.id,entry.state,k=>body.blocks[k]);
+                    await materialize(run.id,entry.state,read);
                     if(entry.id===body.active) active=run.id;
                     for (const p of entry.points) {
                         points.push({...p,id:uid(),run:run.id});
                         refs(p.state).forEach(k=>pinned.add(k));
                     }
                 }
-                const tx=(await meta).transaction(['imports','points','runs','blocks'],'readwrite');
+                const ids=[...pinned],db=await meta;
+                for(let i=0;i<ids.length;i+=4){
+                    const batch=ids.slice(i,i+4),texts=await Promise.all(batch.map(read));
+                    const pin=db.transaction('blocks','readwrite');
+                    batch.forEach((id,j)=>pin.objectStore('blocks').put(texts[j],id));await done(pin);
+                }
+                const tx=db.transaction(['imports','points','runs'],'readwrite');
                 staged.forEach(r=>tx.objectStore('runs').add(r,r.id));
                 points.forEach(p=>tx.objectStore('points').add(p,p.id));
-                pinned.forEach(k=>tx.objectStore('blocks').put(body.blocks[k],k));
                 tx.objectStore('imports').add(active,digest); await done(tx);
                 return active;
             } catch(e) {for(const r of staged) await discard(r.id); throw e;}
@@ -354,5 +373,5 @@
         }
         return result;
     }
-    window.RPLocalArchive={inventory,checkpoint,portable,readPackage,importPackage,retireSyncCopy,fork,activate,runs,points:retainedPoints,remember,beforeDelete,pointSource,recoverCard,activateRecovered,codec:{decode,encode,hash}};
+    window.RPLocalArchive={inventory,checkpoint,portable,readPackage,importPackage,retireSyncCopy,fork,activate,runs,points:retainedPoints,remember,beforeDelete,pointSource,recoverCard,activateRecovered,snapshot,validateState,pointBlock:id=>get('blocks',id),codec:{decode,encode,hash}};
 })();
